@@ -1,6 +1,11 @@
-import pytest
-import time
+import copy
 import threading
+import time
+
+import pytest
+
+from conftest import assert_symbolication
+
 
 WINDOWS_DATA = {
     "signal": None,
@@ -56,14 +61,35 @@ SUCCESS_WINDOWS = {
             "arch": "x86",
             "image_addr": "0x749d0000",
             "image_size": 851_968,
+            "candidates": [
+                {
+                    "download": {"status": "notfound"},
+                    "location": "http://127.0.0.1:1234/msdl/wkernel32.pdb/FF9F9F7841DB88F0CDEDA9E1E9BFF3B51/wkernel32.pd_",
+                    "source": "microsoft",
+                },
+                {
+                    "debug": {"status": "ok"},
+                    "download": {
+                        "features": {
+                            "has_debug_info": True,
+                            "has_sources": False,
+                            "has_symbols": True,
+                            "has_unwind_info": True,
+                        },
+                        "status": "ok",
+                    },
+                    "location": "http://127.0.0.1:1234/msdl/wkernel32.pdb/FF9F9F7841DB88F0CDEDA9E1E9BFF3B51/wkernel32.pdb",
+                    "source": "microsoft",
+                },
+            ],
         }
     ],
     "status": "completed",
 }
 
 
-def _make_unsuccessful_result(status):
-    return {
+def _make_unsuccessful_result(status, source="microsoft"):
+    response = {
         "stacktraces": [
             {
                 "registers": {"eip": "0x1509530"},
@@ -97,10 +123,27 @@ def _make_unsuccessful_result(status):
         ],
         "status": "completed",
     }
+    if source in ["microsoft", "unknown", "broken"]:
+        response["modules"][0]["candidates"] = [
+            {
+                "download": {"status": "notfound"},
+                "location": "http://127.0.0.1:1234/msdl/wkernel32.pdb/FF9F9F7841DB88F0CDEDA9E1E9BFF3B51/wkernel32.pd_",
+                "source": source,
+            },
+            {
+                "download": {"status": "notfound"},
+                "location": "http://127.0.0.1:1234/msdl/wkernel32.pdb/FF9F9F7841DB88F0CDEDA9E1E9BFF3B51/wkernel32.pdb",
+                "source": source,
+            },
+        ]
+    return response
 
 
 MISSING_FILE = _make_unsuccessful_result("missing")
 MALFORMED_FILE = _make_unsuccessful_result("malformed")
+MALFORMED_NO_SOURCES = _make_unsuccessful_result("malformed", source=None)
+NO_SOURCES = _make_unsuccessful_result("missing", source=None)
+UNKNOWN_SOURCE = _make_unsuccessful_result("missing", source="unknown")
 
 
 @pytest.fixture(params=[True, False])
@@ -127,6 +170,9 @@ def test_basic_windows(symbolicator, cache_dir_param, is_public, hitcounter):
                 "is_public": is_public,
             }
         ],
+        options={
+            "dif_candidates": True,
+        },
     )
 
     # i = 0: Cache miss
@@ -139,7 +185,7 @@ def test_basic_windows(symbolicator, cache_dir_param, is_public, hitcounter):
         response = service.post(f"/symbolicate?scope={scope}", json=input)
         response.raise_for_status()
 
-        assert response.json() == SUCCESS_WINDOWS
+        assert_symbolication(response.json(), SUCCESS_WINDOWS)
 
         if cache_dir_param:
             stored_in_scope = "global" if is_public else scope
@@ -184,11 +230,25 @@ def test_no_sources(symbolicator, cache_dir_param):
     response = service.post("/symbolicate", json=input)
     response.raise_for_status()
 
-    assert response.json() == MISSING_FILE
+    assert_symbolication(response.json(), NO_SOURCES)
 
     if cache_dir_param:
         assert not cache_dir_param.join("objects/global").exists()
         assert not cache_dir_param.join("symcaches/global").exists()
+
+
+def test_unknown_field(symbolicator, cache_dir_param):
+    service = symbolicator(cache_dir=cache_dir_param)
+    service.wait_healthcheck()
+
+    request = dict(
+        **WINDOWS_DATA,
+        sources=[],  # Disable for faster test result. We don't care about symbolication
+        unknown="value",  # Should be ignored
+    )
+
+    response = service.post("/symbolicate", json=request)
+    assert response.status_code == 200
 
 
 @pytest.mark.parametrize("is_public", [True, False])
@@ -205,6 +265,9 @@ def test_lookup_deduplication(symbolicator, hitcounter, is_public):
                 "is_public": is_public,
             }
         ],
+        options={
+            "dif_candidates": True,
+        },
     )
 
     service = symbolicator(cache_dir=None)
@@ -225,7 +288,8 @@ def test_lookup_deduplication(symbolicator, hitcounter, is_public):
     for t in ts:
         t.join()
 
-    assert responses == [SUCCESS_WINDOWS] * 20
+    for response in responses:
+        assert_symbolication(response, SUCCESS_WINDOWS)
 
     assert set(hitcounter.hits) == {
         "/msdl/wkernel32.pdb/FF9F9F7841DB88F0CDEDA9E1E9BFF3B51/wkernel32.pd_",
@@ -247,8 +311,21 @@ def test_sources_filetypes(symbolicator, hitcounter):
                 "url": f"{hitcounter.url}/msdl/",
             }
         ],
+        options={
+            "dif_candidates": True,
+        },
         **WINDOWS_DATA,
     )
+    expected = copy.deepcopy(NO_SOURCES)
+    expected["modules"][0]["candidates"] = [
+        {
+            "source": "microsoft",
+            "location": "No object files listed on this source",
+            "download": {
+                "status": "notfound",
+            },
+        }
+    ]
 
     service = symbolicator()
     service.wait_healthcheck()
@@ -256,7 +333,7 @@ def test_sources_filetypes(symbolicator, hitcounter):
     response = service.post("/symbolicate", json=input)
     response.raise_for_status()
 
-    assert response.json() == MISSING_FILE
+    assert_symbolication(response.json(), expected)
     assert not hitcounter.hits
 
 
@@ -274,6 +351,9 @@ def test_unknown_source_config(symbolicator, hitcounter):
                 "not-a-field": "more unknown fields",
             }
         ],
+        options={
+            "dif_candidates": True,
+        },
         **WINDOWS_DATA,
     )
 
@@ -282,7 +362,16 @@ def test_unknown_source_config(symbolicator, hitcounter):
 
     response = service.post("/symbolicate", json=input)
     response.raise_for_status()
-    assert response.json() == MISSING_FILE
+
+    expected = copy.deepcopy(UNKNOWN_SOURCE)
+    for module in expected.get("modules", []):
+        for candidate in module.get("candidates", []):
+            if "location" in candidate:
+                candidate["location"] = candidate["location"].replace(
+                    "/msdl/",
+                    "/respond_statuscode/400/",
+                )
+    assert_symbolication(response.json(), expected)
 
 
 def test_timeouts(symbolicator, hitcounter):
@@ -309,6 +398,9 @@ def test_timeouts(symbolicator, hitcounter):
                         "url": f"{hitcounter.url}/msdl/",
                     }
                 ],
+                options={
+                    "dif_candidates": True,
+                },
                 **WINDOWS_DATA,
             )
             response = service.post("/symbolicate?timeout=1", json=input)
@@ -328,7 +420,7 @@ def test_timeouts(symbolicator, hitcounter):
         assert response["status"] == "pending"
         assert response["request_id"] == request_id
 
-    assert responses[-1] == SUCCESS_WINDOWS
+    assert_symbolication(responses[-1], SUCCESS_WINDOWS)
     assert len(responses) > 1
 
     assert hitcounter.hits == {
@@ -353,6 +445,9 @@ def test_unreachable_bucket(symbolicator, hitcounter, statuscode, bucket_type):
                 "token": "123abc",  # only relevant for sentry type
             }
         ],
+        options={
+            "dif_candidates": True,
+        },
         **WINDOWS_DATA,
     )
 
@@ -363,7 +458,29 @@ def test_unreachable_bucket(symbolicator, hitcounter, statuscode, bucket_type):
     response.raise_for_status()
     response = response.json()
     # TODO(markus): Better error reporting
-    assert response == MISSING_FILE
+    if bucket_type == "sentry":
+        expected = copy.deepcopy(NO_SOURCES)
+        expected["modules"][0]["candidates"] = [
+            {
+                "source": "broken",
+                "location": "No object files listed on this source",
+                "download": {
+                    "status": "notfound",
+                },
+            }
+        ]
+        assert_symbolication(response, expected)
+    else:
+        expected = _make_unsuccessful_result(status="missing", source="broken")
+        for module in expected.get("modules", []):
+            for candidate in module.get("candidates", []):
+                if "location" in candidate:
+                    candidate["location"] = candidate["location"].replace(
+                        "/msdl/",
+                        f"/respond_statuscode/{statuscode}/",
+                    )
+
+        assert_symbolication(response, expected)
 
 
 def test_malformed_objects(symbolicator, hitcounter):
@@ -376,6 +493,9 @@ def test_malformed_objects(symbolicator, hitcounter):
                 "url": f"{hitcounter.url}/garbage_data/",
             }
         ],
+        options={
+            "dif_candidates": True,
+        },
         **WINDOWS_DATA,
     )
 
@@ -385,7 +505,7 @@ def test_malformed_objects(symbolicator, hitcounter):
     response = service.post("/symbolicate", json=input)
     response.raise_for_status()
     response = response.json()
-    assert response == MALFORMED_FILE
+    assert_symbolication(response, MALFORMED_NO_SOURCES)
 
 
 @pytest.mark.parametrize(
@@ -394,8 +514,8 @@ def test_malformed_objects(symbolicator, hitcounter):
         [["?:/windows/**"], SUCCESS_WINDOWS],
         [["?:/windows/*"], SUCCESS_WINDOWS],
         [[], SUCCESS_WINDOWS],
-        [["?:/windows/"], MISSING_FILE],
-        [["d:/windows/**"], MISSING_FILE],
+        [["?:/windows/"], NO_SOURCES],
+        [["d:/windows/**"], NO_SOURCES],
     ],
 )
 def test_path_patterns(symbolicator, hitcounter, patterns, output):
@@ -409,8 +529,22 @@ def test_path_patterns(symbolicator, hitcounter, patterns, output):
                 "url": f"{hitcounter.url}/msdl/",
             }
         ],
+        options={
+            "dif_candidates": True,
+        },
         **WINDOWS_DATA,
     )
+    if output == NO_SOURCES:
+        output = copy.deepcopy(output)
+        output["modules"][0]["candidates"] = [
+            {
+                "source": "microsoft",
+                "location": "No object files listed on this source",
+                "download": {
+                    "status": "notfound",
+                },
+            }
+        ]
 
     service = symbolicator()
     service.wait_healthcheck()
@@ -418,7 +552,7 @@ def test_path_patterns(symbolicator, hitcounter, patterns, output):
     response = service.post("/symbolicate", json=input)
     response.raise_for_status()
 
-    assert response.json() == output
+    assert_symbolication(response.json(), output)
 
 
 def test_redirects(symbolicator, hitcounter):
@@ -431,6 +565,9 @@ def test_redirects(symbolicator, hitcounter):
                 "url": f"{hitcounter.url}/redirect/msdl/",
             }
         ],
+        options={
+            "dif_candidates": True,
+        },
         **WINDOWS_DATA,
     )
 
@@ -440,7 +577,15 @@ def test_redirects(symbolicator, hitcounter):
     response = service.post("/symbolicate", json=input)
     response.raise_for_status()
 
-    assert response.json() == SUCCESS_WINDOWS
+    expected = copy.deepcopy(SUCCESS_WINDOWS)
+    for module in expected.get("modules", []):
+        for candidate in module.get("candidates", []):
+            if "location" in candidate:
+                candidate["location"] = candidate["location"].replace(
+                    "/msdl/", "/redirect/msdl/"
+                )
+
+    assert_symbolication(response.json(), expected)
 
 
 @pytest.mark.parametrize("allow_reserved_ip", [True, False])
@@ -461,6 +606,9 @@ def test_reserved_ip_addresses(symbolicator, hitcounter, allow_reserved_ip, host
                 "url": f"{url}/msdl/",
             }
         ],
+        options={
+            "dif_candidates": True,
+        },
         **WINDOWS_DATA,
     )
 
@@ -469,7 +617,36 @@ def test_reserved_ip_addresses(symbolicator, hitcounter, allow_reserved_ip, host
 
     if allow_reserved_ip:
         assert hitcounter.hits
-        assert response.json() == SUCCESS_WINDOWS
+        assert_symbolication(response.json(), SUCCESS_WINDOWS)
     else:
         assert not hitcounter.hits
-        assert response.json() == MISSING_FILE
+        assert_symbolication(response.json(), MISSING_FILE)
+
+
+def test_no_dif_candidates(symbolicator, hitcounter):
+    # Asserts that disabling requesting for DIF candidates info works.
+    service = symbolicator()
+    service.wait_healthcheck()
+
+    request_data = dict(
+        **WINDOWS_DATA,
+        sources=[
+            {
+                "type": "http",
+                "id": "microsoft",
+                "layout": {"type": "symstore"},
+                "filters": {"filetypes": ["pdb", "pe"]},
+                "url": f"{hitcounter.url}/msdl/",
+            }
+        ],
+    )
+
+    response = service.post("/symbolicate", json=request_data)
+    response.raise_for_status()
+
+    success_response = copy.deepcopy(SUCCESS_WINDOWS)
+    for module in success_response["modules"]:
+        del module["candidates"]
+
+    assert hitcounter.hits
+    assert_symbolication(response.json(), success_response)

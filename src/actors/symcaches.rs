@@ -4,22 +4,25 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::{compat::Future01CompatExt, FutureExt, TryFutureExt};
-use futures01::future::{Either, Future, IntoFuture};
-use sentry::configure_scope;
+use futures::compat::Future01CompatExt;
+use futures::future::{self, Either, Future, TryFutureExt};
+use sentry::{configure_scope, Hub, SentryFutureExt};
 use symbolic::common::{Arch, ByteView};
 use symbolic::symcache::{self, SymCache, SymCacheWriter};
 use thiserror::Error;
 
 use crate::actors::common::cache::{CacheItemRequest, CachePath, Cacher};
 use crate::actors::objects::{
-    FindObject, ObjectError, ObjectFile, ObjectFileMeta, ObjectPurpose, ObjectsActor,
+    FindObject, FoundObject, ObjectError, ObjectHandle, ObjectMetaHandle, ObjectPurpose,
+    ObjectsActor,
 };
 use crate::cache::{Cache, CacheKey, CacheStatus};
 use crate::sources::{FileType, SourceConfig};
-use crate::types::{ObjectFeatures, ObjectId, ObjectType, Scope};
-use crate::utils::futures::ThreadPool;
-use crate::utils::sentry::{SentryFutureExt, WriteSentryScope};
+use crate::types::{
+    AllObjectCandidates, ObjectFeatures, ObjectId, ObjectType, ObjectUseInfo, Scope,
+};
+use crate::utils::futures::{BoxedFuture, ThreadPool};
+use crate::utils::sentry::WriteSentryScope;
 
 /// Errors happening while generating a symcache.
 #[derive(Debug, Error)]
@@ -75,6 +78,7 @@ pub struct SymCacheFile {
     features: ObjectFeatures,
     status: CacheStatus,
     arch: Arch,
+    candidates: AllObjectCandidates,
 }
 
 impl SymCacheFile {
@@ -97,14 +101,20 @@ impl SymCacheFile {
     pub fn features(&self) -> ObjectFeatures {
         self.features
     }
+
+    /// Returns the list of DIFs which were searched for this symcache.
+    pub fn candidates(&self) -> AllObjectCandidates {
+        self.candidates.clone()
+    }
 }
 
 #[derive(Clone, Debug)]
 struct FetchSymCacheInternal {
     request: FetchSymCache,
     objects_actor: ObjectsActor,
-    object_meta: Arc<ObjectFileMeta>,
+    object_meta: Arc<ObjectMetaHandle>,
     threadpool: ThreadPool,
+    candidates: AllObjectCandidates,
 }
 
 impl CacheItemRequest for FetchSymCacheInternal {
@@ -115,7 +125,7 @@ impl CacheItemRequest for FetchSymCacheInternal {
         self.object_meta.cache_key()
     }
 
-    fn compute(&self, path: &Path) -> Box<dyn Future<Item = CacheStatus, Error = Self::Error>> {
+    fn compute(&self, path: &Path) -> BoxedFuture<Result<CacheStatus, Self::Error>> {
         let path = path.to_owned();
         let object = self
             .objects_actor
@@ -124,7 +134,7 @@ impl CacheItemRequest for FetchSymCacheInternal {
 
         let threadpool = self.threadpool.clone();
         let result = object.and_then(move |object| {
-            let future = futures01::lazy(move || {
+            let future = future::lazy(move |_| {
                 if object.status() != CacheStatus::Positive {
                     return Ok(object.status());
                 }
@@ -142,21 +152,21 @@ impl CacheItemRequest for FetchSymCacheInternal {
             });
 
             threadpool
-                .spawn_handle(future.sentry_hub_current().compat())
-                .boxed_local()
-                .compat()
-                .map_err(|_| SymCacheError::Canceled)
-                .flatten()
+                .spawn_handle(future.bind_hub(Hub::current()))
+                .unwrap_or_else(|_| Err(SymCacheError::Canceled))
         });
 
         let num_sources = self.request.sources.len();
 
-        Box::new(future_metrics!(
-            "symcaches",
-            Some((Duration::from_secs(1200), SymCacheError::Timeout)),
-            result,
-            "num_sources" => &num_sources.to_string()
-        ))
+        Box::pin(
+            future_metrics!(
+                "symcaches",
+                Some((Duration::from_secs(1200), SymCacheError::Timeout)),
+                result.compat(),
+                "num_sources" => &num_sources.to_string()
+            )
+            .compat(),
+        )
     }
 
     fn should_load(&self, data: &[u8]) -> bool {
@@ -177,6 +187,13 @@ impl CacheItemRequest for FetchSymCacheInternal {
             .map(|cache| cache.arch())
             .unwrap_or_default();
 
+        let mut candidates = self.candidates.clone(); // yuk!
+        candidates.set_debug(
+            self.object_meta.source_id().clone(),
+            &self.object_meta.uri(),
+            ObjectUseInfo::from_derived_status(status, self.object_meta.status()),
+        );
+
         SymCacheFile {
             object_type: self.request.object_type,
             identifier: self.request.identifier.clone(),
@@ -185,6 +202,7 @@ impl CacheItemRequest for FetchSymCacheInternal {
             features: self.object_meta.features(),
             status,
             arch,
+            candidates,
         }
     }
 }
@@ -194,7 +212,7 @@ impl CacheItemRequest for FetchSymCacheInternal {
 pub struct FetchSymCache {
     pub object_type: ObjectType,
     pub identifier: ObjectId,
-    pub sources: Arc<Vec<SourceConfig>>,
+    pub sources: Arc<[SourceConfig]>,
     pub scope: Scope,
 }
 
@@ -202,9 +220,10 @@ impl SymCacheActor {
     pub fn fetch(
         &self,
         request: FetchSymCache,
-    ) -> impl Future<Item = Arc<SymCacheFile>, Error = Arc<SymCacheError>> {
-        let object = self
+    ) -> impl Future<Output = Result<Arc<SymCacheFile>, Arc<SymCacheError>>> {
+        let find_result_future = self
             .objects
+            .clone()
             .find(FindObject {
                 filetypes: FileType::from_object_type(request.object_type),
                 identifier: request.identifier.clone(),
@@ -222,35 +241,34 @@ impl SymCacheActor {
         let identifier = request.identifier.clone();
         let scope = request.scope.clone();
 
-        object.and_then(move |object| {
-            object
-                .map(move |object| {
-                    Either::A(symcaches.compute_memoized(FetchSymCacheInternal {
-                        request,
-                        objects_actor: objects,
-                        object_meta: object,
-                        threadpool,
-                    }))
-                })
-                .unwrap_or_else(move || {
-                    Either::B(
-                        Ok(Arc::new(SymCacheFile {
-                            object_type,
-                            identifier,
-                            scope,
-                            data: ByteView::from_slice(b""),
-                            features: ObjectFeatures::default(),
-                            status: CacheStatus::Negative,
-                            arch: Arch::Unknown,
-                        }))
-                        .into_future(),
-                    )
-                })
+        find_result_future.and_then(move |find_result: FoundObject| {
+            let FoundObject { meta, candidates } = find_result;
+            meta.map(clone!(candidates, |object_meta| {
+                Either::Left(symcaches.compute_memoized(FetchSymCacheInternal {
+                    request,
+                    objects_actor: objects,
+                    object_meta,
+                    threadpool,
+                    candidates,
+                }))
+            }))
+            .unwrap_or_else(move || {
+                Either::Right(future::ok(Arc::new(SymCacheFile {
+                    object_type,
+                    identifier,
+                    scope,
+                    data: ByteView::from_slice(b""),
+                    features: ObjectFeatures::default(),
+                    status: CacheStatus::Negative,
+                    arch: Arch::Unknown,
+                    candidates,
+                })))
+            })
         })
     }
 }
 
-fn write_symcache(path: &Path, object: &ObjectFile) -> Result<(), SymCacheError> {
+fn write_symcache(path: &Path, object: &ObjectHandle) -> Result<(), SymCacheError> {
     configure_scope(|scope| {
         scope.set_transaction(Some("compute_symcache"));
         object.write_sentry_scope(scope);

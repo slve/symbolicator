@@ -1,9 +1,9 @@
-use actix::ResponseFuture;
 use actix_web::{
     dev::Payload, error, http::Method, multipart, Error, HttpMessage, HttpRequest, Json, Query,
     State,
 };
 use bytes::Bytes;
+use futures::{FutureExt, TryFutureExt};
 use futures01::{future, Future, Stream};
 use sentry::{configure_scope, Hub};
 
@@ -11,15 +11,18 @@ use crate::actors::symbolication::SymbolicationActor;
 use crate::app::{ServiceApp, ServiceState};
 use crate::endpoints::symbolicate::SymbolicationRequestQueryParams;
 use crate::sources::SourceConfig;
-use crate::types::{RequestId, Scope, SymbolicationResponse};
-use crate::utils::futures::ThreadPool;
-use crate::utils::multipart::{read_multipart_file, read_multipart_sources};
+use crate::types::{RequestId, RequestOptions, Scope, SymbolicationResponse};
+use crate::utils::futures::{ResponseFuture, ThreadPool};
+use crate::utils::multipart::{
+    read_multipart_file, read_multipart_request_options, read_multipart_sources,
+};
 use crate::utils::sentry::{ActixWebHubExt, SentryFutureExt, WriteSentryScope};
 
 #[derive(Debug, Default)]
 struct AppleCrashReportRequest {
     sources: Option<Vec<SourceConfig>>,
     apple_crash_report: Option<Bytes>,
+    options: RequestOptions,
 }
 
 fn handle_multipart_item(
@@ -53,9 +56,16 @@ fn handle_multipart_item(
             });
             Box::new(future)
         }
+        Some("options") => {
+            let future = read_multipart_request_options(field).map(move |options| {
+                request.options = options;
+                request
+            });
+            Box::new(future)
+        }
         _ => {
-            let error = error::ErrorBadRequest("unknown formdata field");
-            Box::new(future::err(error))
+            // Always ignore unknown fields.
+            Box::new(future::ok(request))
         }
     }
 }
@@ -74,7 +84,7 @@ fn handle_multipart_stream(
     Box::new(future)
 }
 
-fn parse_apple_crash_report(
+fn process_apple_crash_report(
     symbolication: &SymbolicationActor,
     request: AppleCrashReportRequest,
     scope: Scope,
@@ -87,7 +97,7 @@ fn parse_apple_crash_report(
         .sources
         .ok_or_else(|| error::ErrorBadRequest("missing sources"))?;
 
-    Ok(symbolication.process_apple_crash_report(scope, report, sources))
+    Ok(symbolication.process_apple_crash_report(scope, report, sources, request.options))
 }
 
 fn handle_apple_crash_report_request(
@@ -96,6 +106,7 @@ fn handle_apple_crash_report_request(
     request: HttpRequest<ServiceState>,
 ) -> ResponseFuture<Json<SymbolicationResponse>, Error> {
     let hub = Hub::from_request(&request);
+    hub.start_session();
 
     Hub::run(hub, || {
         let default_sources = state.config().default_sources();
@@ -117,20 +128,23 @@ fn handle_apple_crash_report_request(
         let response_future = request_future
             .and_then(clone!(symbolication, |mut request| {
                 if request.sources.is_none() {
-                    request.sources = Some((*default_sources).clone());
+                    request.sources = Some(default_sources.to_vec());
                 }
 
-                parse_apple_crash_report(&symbolication, request, scope)
+                process_apple_crash_report(&symbolication, request, scope)
             }))
             .and_then(move |request_id| {
                 symbolication
                     .get_response(request_id, timeout)
+                    .never_error()
+                    .boxed_local()
+                    .compat()
                     .then(|result| match result {
                         Ok(Some(response)) => Ok(Json(response)),
                         Ok(None) => Err(error::ErrorInternalServerError(
                             "symbolication request did not start",
                         )),
-                        Err(error) => Err(error::ErrorInternalServerError(error)),
+                        Err(never) => match never {},
                     })
                     .map_err(Error::from)
             });
@@ -144,4 +158,70 @@ pub fn configure(app: ServiceApp) -> ServiceApp {
         r.method(Method::POST)
             .with(handle_apple_crash_report_request);
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use actix_web::test::TestServer;
+    use reqwest::{multipart, Client, StatusCode};
+
+    use crate::app::ServiceState;
+    use crate::config::Config;
+    use crate::test;
+    use crate::types::SymbolicationResponse;
+
+    #[tokio::test]
+    async fn test_basic() {
+        test::setup();
+
+        let service = ServiceState::create(Config::default()).unwrap();
+        let server = TestServer::with_factory(move || crate::server::create_app(service.clone()));
+
+        let file_contents = fs::read("tests/fixtures/apple_crash_report.txt").unwrap();
+        let file_part = multipart::Part::bytes(file_contents).file_name("apple_crash_report.txt");
+
+        let form = multipart::Form::new()
+            .part("apple_crash_report", file_part)
+            .text("sources", "[]");
+
+        let response = Client::new()
+            .post(&server.url("/applecrashreport"))
+            .multipart(form)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.text().await.unwrap();
+        let response = serde_json::from_str::<SymbolicationResponse>(&body).unwrap();
+        insta::assert_yaml_snapshot!(response);
+    }
+
+    #[tokio::test]
+    async fn test_unknown_field() {
+        test::setup();
+
+        let service = ServiceState::create(Config::default()).unwrap();
+        let server = TestServer::with_factory(move || crate::server::create_app(service.clone()));
+
+        let file_contents = fs::read("tests/fixtures/apple_crash_report.txt").unwrap();
+        let file_part = multipart::Part::bytes(file_contents).file_name("apple_crash_report.txt");
+
+        let form = multipart::Form::new()
+            .part("apple_crash_report", file_part)
+            .text("sources", "[]")
+            .text("unknown", "value");
+
+        let response = Client::new()
+            .post(&server.url("/applecrashreport"))
+            .multipart(form)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }

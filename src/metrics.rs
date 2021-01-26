@@ -41,8 +41,8 @@ pub fn configure_statsd<A: ToSocketAddrs>(prefix: &str, host: A) {
 
 /// Invoke a callback with the current statsd client.
 ///
-/// If statsd is not configured the callback is not invoked.  For the most part
-/// the `metric!` macro should be used instead.
+/// If statsd is not configured the callback is not invoked. For the most part
+/// the [`metric!`] macro should be used instead.
 #[inline(always)]
 pub fn with_client<F, R>(f: F) -> R
 where
@@ -126,8 +126,8 @@ macro_rules! future_metrics {
     // Collect generic metrics about a future
     ($task_name:expr, $timeout:expr, $future:expr $(, $k:expr => $v:expr)* $(,)?) => {{
         use std::time::Instant;
-        use futures01::future::{self, Either};
-        use tokio::prelude::FutureExt;
+        use futures01::future::{self, Either, Future};
+        use tokio01::prelude::FutureExt;
 
         let creation_time = Instant::now();
 

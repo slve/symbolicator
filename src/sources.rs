@@ -1,23 +1,49 @@
-//! Download sources types and related `impl`s.
+//! Download sources types and related implementations.
 
+use anyhow::Result;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
 
 use crate::types::{Glob, ObjectId, ObjectType};
 use crate::utils::paths;
 use crate::utils::sentry::WriteSentryScope;
 
+/// An identifier for DIF sources.
+///
+/// This is essentially a newtype for a string.
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub struct SourceId(String);
+
+// For now we allow this to be unused, some tests use these already.
+impl SourceId {
+    #[allow(unused)]
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    #[allow(unused)]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SourceId {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Configuration for an external source.
 ///
 /// Sources provide the ability to download Download Information Files (DIF).
 /// Their configuration is a combination of the location of the source plus any
 /// required authentication etc.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SourceConfig {
     /// Sentry debug files endpoint.
@@ -34,7 +60,7 @@ pub enum SourceConfig {
 
 impl SourceConfig {
     /// The unique identifier of this source.
-    pub fn id(&self) -> &str {
+    pub fn id(&self) -> &SourceId {
         match *self {
             SourceConfig::Http(ref x) => &x.id,
             SourceConfig::S3(ref x) => &x.id,
@@ -74,80 +100,26 @@ impl WriteSentryScope for SourceConfig {
     }
 }
 
-/// A location for a file retrievable from many source configs.
-///
-/// It is essentially a `/`-separated string.  This is currently used by all
-/// sources other than [`SentrySourceConfig`].  This may change in the future.
-///
-/// [`SentrySourceConfig`]: struct.SentrySourceConfig.html
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
-pub struct SourceLocation(String);
-
-impl SourceLocation {
-    pub fn new(loc: impl Into<String>) -> Self {
-        SourceLocation(loc.into())
-    }
-
-    /// Return an iterator of the location segments.
-    pub fn segments<'a>(&'a self) -> impl Iterator<Item = &str> + 'a {
-        self.0.split('/').filter(|s| !s.is_empty())
-    }
-}
-
-impl fmt::Display for SourceLocation {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// An identifier for a file retrievable from a [`SentrySourceConfig`].
-///
-/// [`SentrySourceConfig`]: struct.SentrySourceConfig.html
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
-pub struct SentryFileId(String);
-
-impl SentryFileId {
-    pub fn new(id: impl Into<String>) -> Self {
-        SentryFileId(id.into())
-    }
-}
-
-impl fmt::Display for SentryFileId {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
 /// Configuration for the Sentry-internal debug files endpoint.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SentrySourceConfig {
     /// Unique source identifier.
-    pub id: String,
+    pub id: SourceId,
 
     /// Absolute URL of the endpoint.
-    #[serde(with = "url_serde")]
     pub url: Url,
 
     /// Bearer authorization token.
     pub token: String,
 }
 
-impl SentrySourceConfig {
-    pub fn download_url(&self, file_id: &SentryFileId) -> Url {
-        let mut url = self.url.clone();
-        url.query_pairs_mut().append_pair("id", &file_id.0);
-        url
-    }
-}
-
 /// Configuration for symbol server HTTP endpoints.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HttpSourceConfig {
     /// Unique source identifier.
-    pub id: String,
+    pub id: SourceId,
 
     /// Absolute URL of the symbol server.
-    #[serde(with = "url_serde")]
     pub url: Url,
 
     /// Additional headers to be sent to the symbol server with every request.
@@ -159,86 +131,16 @@ pub struct HttpSourceConfig {
 }
 
 /// Configuration for reading from the local file system.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct FilesystemSourceConfig {
     /// Unique source identifier.
-    pub id: String,
+    pub id: SourceId,
 
     /// Path to symbol directory.
     pub path: PathBuf,
 
     #[serde(flatten)]
     pub files: CommonSourceConfig,
-}
-
-impl FilesystemSourceConfig {
-    pub fn join_loc(&self, loc: &SourceLocation) -> PathBuf {
-        self.path.join(&loc.0)
-    }
-}
-
-/// This uniquely identifies a file on a source and how to download it.
-///
-/// This is a combination of the [`SourceConfig`], which describes a download
-/// source and how to download rom it, with an identifier describing a single
-/// file in that source.
-///
-/// [`SourceConfig`]: enum.SourceConfig.html
-#[derive(Debug, Clone)]
-pub enum SourceFileId {
-    Sentry(Arc<SentrySourceConfig>, SentryFileId),
-    Http(Arc<HttpSourceConfig>, SourceLocation),
-    S3(Arc<S3SourceConfig>, SourceLocation),
-    Gcs(Arc<GcsSourceConfig>, SourceLocation),
-    Filesystem(Arc<FilesystemSourceConfig>, SourceLocation),
-}
-
-impl SourceFileId {
-    pub fn source(&self) -> SourceConfig {
-        match *self {
-            SourceFileId::Sentry(ref x, ..) => SourceConfig::Sentry(x.clone()),
-            SourceFileId::S3(ref x, ..) => SourceConfig::S3(x.clone()),
-            SourceFileId::Gcs(ref x, ..) => SourceConfig::Gcs(x.clone()),
-            SourceFileId::Http(ref x, ..) => SourceConfig::Http(x.clone()),
-            SourceFileId::Filesystem(ref x, ..) => SourceConfig::Filesystem(x.clone()),
-        }
-    }
-
-    pub fn cache_key(&self) -> String {
-        match self {
-            SourceFileId::Http(ref source, ref path) => format!("{}.{}", source.id, path.0),
-            SourceFileId::S3(ref source, ref path) => format!("{}.{}", source.id, path.0),
-            SourceFileId::Gcs(ref source, ref path) => format!("{}.{}", source.id, path.0),
-            SourceFileId::Sentry(ref source, ref file_id) => {
-                format!("{}.{}.sentryinternal", source.id, file_id.0)
-            }
-            SourceFileId::Filesystem(ref source, ref path) => format!("{}.{}", source.id, path.0),
-        }
-    }
-}
-
-impl WriteSentryScope for SourceFileId {
-    fn write_sentry_scope(&self, scope: &mut ::sentry::Scope) {
-        self.source().write_sentry_scope(scope);
-    }
-}
-
-impl fmt::Display for SourceFileId {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            SourceFileId::Sentry(cfg, id) => {
-                write!(f, "Sentry source '{}' file id '{}'", cfg.id, id)
-            }
-            SourceFileId::Http(cfg, loc) => {
-                write!(f, "HTTP source '{}' location '{}'", cfg.id, loc)
-            }
-            SourceFileId::S3(cfg, loc) => write!(f, "S3 source '{}' location '{}'", cfg.id, loc),
-            SourceFileId::Gcs(cfg, loc) => write!(f, "GCS source '{}' location '{}'", cfg.id, loc),
-            SourceFileId::Filesystem(cfg, loc) => {
-                write!(f, "Filesystem source '{}' location '{}'", cfg.id, loc)
-            }
-        }
-    }
 }
 
 /// Local helper to deserializes an S3 region string in `S3SourceKey`.
@@ -256,7 +158,7 @@ where
 }
 
 /// Amazon S3 authorization information.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct S3SourceKey {
     /// The region of the S3 bucket.
     #[serde(deserialize_with = "deserialize_region")]
@@ -288,7 +190,7 @@ impl std::hash::Hash for S3SourceKey {
 }
 
 /// GCS authorization information.
-#[derive(Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub struct GcsSourceKey {
     /// Gcs authorization key.
     pub private_key: String,
@@ -298,10 +200,10 @@ pub struct GcsSourceKey {
 }
 
 /// Configuration for a GCS symbol buckets.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct GcsSourceConfig {
     /// Unique source identifier.
-    pub id: String,
+    pub id: SourceId,
 
     /// Name of the GCS bucket.
     pub bucket: String,
@@ -318,29 +220,11 @@ pub struct GcsSourceConfig {
     pub files: CommonSourceConfig,
 }
 
-fn join_prefix_location(prefix: &str, location: &SourceLocation) -> String {
-    let trimmed = prefix.trim_matches(&['/'][..]);
-    if trimmed.is_empty() {
-        location.0.clone()
-    } else {
-        format!("{}/{}", trimmed, location.0)
-    }
-}
-
-impl GcsSourceConfig {
-    /// Return the bucket's key for the required file.
-    ///
-    /// This key identifies the file in the bucket.
-    pub fn get_key(&self, location: &SourceLocation) -> String {
-        join_prefix_location(&self.prefix, location)
-    }
-}
-
 /// Configuration for S3 symbol buckets.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct S3SourceConfig {
     /// Unique source identifier.
-    pub id: String,
+    pub id: SourceId,
 
     /// Name of the bucket in the S3 account.
     pub bucket: String,
@@ -357,17 +241,8 @@ pub struct S3SourceConfig {
     pub files: CommonSourceConfig,
 }
 
-impl S3SourceConfig {
-    /// Return the bucket's key for the required file.
-    ///
-    /// This key identifies the file in the bucket.
-    pub fn get_key(&self, location: &SourceLocation) -> String {
-        join_prefix_location(&self.prefix, location)
-    }
-}
-
 /// Common parameters for external filesystem-like buckets configured by users.
-#[derive(Deserialize, Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct CommonSourceConfig {
     /// Influence whether this source will be selected
@@ -380,8 +255,21 @@ pub struct CommonSourceConfig {
     pub is_public: bool,
 }
 
+impl CommonSourceConfig {
+    #[cfg(test)]
+    pub fn with_layout(layout_type: DirectoryLayoutType) -> Self {
+        Self {
+            layout: DirectoryLayout {
+                ty: layout_type,
+                ..DirectoryLayout::default()
+            },
+            ..Self::default()
+        }
+    }
+}
+
 /// Common attributes to make the symbolicator skip/consider sources by certain criteria.
-#[derive(Deserialize, Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SourceFilters {
     /// File types that are supported by this server.
@@ -406,17 +294,19 @@ impl SourceFilters {
 }
 
 /// Determines how files are named in an external source.
-#[derive(Deserialize, Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct DirectoryLayout {
     /// Directory layout of this symbol server.
     #[serde(rename = "type")]
     pub ty: DirectoryLayoutType,
 
-    /// Overwrite filename casing convention of `self.layout`. This is useful in the case of
-    /// DirectoryLayout::Symstore, where servers are supposed to handle requests
-    /// case-insensitively, but practically don't (in the case of S3 buckets it's not possible),
-    /// making this aspect not well-specified.
+    /// Overwrite the default filename casing convention of the [layout type](Self::ty).
+    ///
+    /// This is useful in the case of [`DirectoryLayoutType::Symstore`], where servers are supposed to
+    /// handle requests case-insensitively, but practically do not, making this aspect not
+    /// well-specified. For instance, in S3 buckets it is not possible to perform case-insensitive
+    /// queries.
     pub casing: FilenameCasing,
 }
 
@@ -429,8 +319,8 @@ impl Default for DirectoryLayout {
     }
 }
 
-/// Known conventions for `DirectoryLayout`
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+/// Known conventions for [`DirectoryLayout`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub enum DirectoryLayoutType {
     /// Uses conventions of native debuggers.
     #[serde(rename = "native")]
@@ -444,15 +334,15 @@ pub enum DirectoryLayoutType {
     /// Uses Microsoft SSQP server conventions.
     #[serde(rename = "ssqp")]
     SSQP,
-    /// debuginfod conventions.
+    /// Uses [debuginfod](https://www.mankier.com/8/debuginfod) conventions.
     #[serde(rename = "debuginfod")]
     Debuginfod,
-    /// unified sentry propriertary bucket format
+    /// Unified sentry propriertary bucket format.
     #[serde(rename = "unified")]
     Unified,
 }
 
-#[derive(Deserialize, Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FilenameCasing {
     Default,
@@ -466,7 +356,7 @@ impl Default for FilenameCasing {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileType {
     /// Windows/PDB code files
@@ -481,6 +371,10 @@ pub enum FileType {
     ElfDebug,
     /// Linux/ELF code files
     ElfCode,
+    /// A WASM debug file
+    WasmDebug,
+    /// A WASM code file
+    WasmCode,
     /// Breakpad files (this is the reason we have a flat enum for what at first sight could've
     /// been two enums)
     Breakpad,
@@ -501,6 +395,8 @@ impl FileType {
             Pe,
             MachCode,
             ElfCode,
+            WasmCode,
+            WasmDebug,
             Breakpad,
             SourceBundle,
         ]
@@ -519,6 +415,7 @@ impl FileType {
             ObjectType::Macho => &[FileType::MachDebug, FileType::MachCode, FileType::Breakpad],
             ObjectType::Pe => &[FileType::Pdb, FileType::Pe, FileType::Breakpad],
             ObjectType::Elf => &[FileType::ElfDebug, FileType::ElfCode, FileType::Breakpad],
+            ObjectType::Wasm => &[FileType::WasmCode, FileType::WasmDebug],
             _ => Self::all(),
         }
     }
@@ -533,40 +430,10 @@ impl AsRef<str> for FileType {
             FileType::MachCode => "mach_code",
             FileType::ElfDebug => "elf_debug",
             FileType::ElfCode => "elf_code",
+            FileType::WasmDebug => "wasm_debug",
+            FileType::WasmCode => "wasm_code",
             FileType::Breakpad => "breakpad",
             FileType::SourceBundle => "sourcebundle",
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_join_prefix_location() {
-        let key = join_prefix_location(&String::from(""), &SourceLocation::new("spam/ham"));
-        assert_eq!(key, "spam/ham");
-
-        let key = join_prefix_location(&String::from("eggs"), &SourceLocation::new("spam/ham"));
-        assert_eq!(key, "eggs/spam/ham");
-
-        let key = join_prefix_location(&String::from("/eggs/bacon/"), &SourceLocation::new("spam"));
-        assert_eq!(key, "eggs/bacon/spam");
-
-        let key = join_prefix_location(&String::from("//eggs//"), &SourceLocation::new("spam"));
-        assert_eq!(key, "eggs/spam");
-    }
-
-    #[test]
-    fn test_sentry_source_download_url() {
-        let source = SentrySourceConfig {
-            id: "test".into(),
-            url: Url::parse("https://example.net/endpoint/").unwrap(),
-            token: "token".into(),
-        };
-        let file_id = SentryFileId("abc123".into());
-        let url = source.download_url(&file_id);
-        assert_eq!(url.as_str(), "https://example.net/endpoint/?id=abc123");
     }
 }

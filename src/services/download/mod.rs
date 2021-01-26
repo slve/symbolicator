@@ -10,27 +10,23 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ::sentry::{Hub, SentryFutureExt};
-use actix_web::error::PayloadError;
-use bytes::Bytes;
-use failure::Fail;
 use futures::prelude::*;
 use thiserror::Error;
 
-use crate::utils::futures::RemoteThread;
+use crate::utils::futures::{m, measure};
 use crate::utils::paths::get_directory_paths;
 
 mod filesystem;
 mod gcs;
 mod http;
+mod locations;
 mod s3;
 mod sentry;
 
 use crate::config::Config;
-pub use crate::sources::{
-    DirectoryLayout, FileType, SentryFileId, SourceConfig, SourceFileId, SourceFilters,
-    SourceLocation,
-};
+pub use crate::sources::{DirectoryLayout, FileType, SourceConfig, SourceFilters};
 pub use crate::types::ObjectId;
+pub use locations::{ObjectFileSource, ObjectFileSourceURI, SourceLocation};
 
 /// HTTP User-Agent string to use.
 const USER_AGENT: &str = concat!("symbolicator/", env!("CARGO_PKG_VERSION"));
@@ -40,8 +36,8 @@ const USER_AGENT: &str = concat!("symbolicator/", env!("CARGO_PKG_VERSION"));
 pub enum DownloadError {
     #[error("failed to download")]
     Io(#[source] std::io::Error),
-    #[error("failed to download stream")]
-    Stream(#[source] failure::Compat<PayloadError>),
+    #[error("failed to download")]
+    Reqwest(#[source] reqwest::Error),
     #[error("bad file destination")]
     BadDestination(#[source] std::io::Error),
     #[error("failed writing the downloaded file")]
@@ -54,12 +50,6 @@ pub enum DownloadError {
     Sentry(#[from] sentry::SentryError),
 }
 
-impl DownloadError {
-    pub fn stream(err: PayloadError) -> Self {
-        Self::Stream(err.compat())
-    }
-}
-
 /// Completion status of a successful download request.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum DownloadStatus {
@@ -69,94 +59,132 @@ pub enum DownloadStatus {
     NotFound,
 }
 
-/// Dispatches downloading of the given file to the appropriate source.
-async fn dispatch_download(
-    source: SourceFileId,
-    destination: PathBuf,
-) -> Result<DownloadStatus, DownloadError> {
-    match source {
-        SourceFileId::Sentry(source, loc) => {
-            sentry::download_source(source, loc, destination).await
-        }
-        SourceFileId::Http(source, loc) => http::download_source(source, loc, destination).await,
-        SourceFileId::S3(source, loc) => s3::download_source(source, loc, destination).await,
-        SourceFileId::Gcs(source, loc) => gcs::download_source(source, loc, destination).await,
-        SourceFileId::Filesystem(source, loc) => {
-            filesystem::download_source(source, loc, destination)
-        }
-    }
-}
-
 /// A service which can download files from a [`SourceConfig`].
 ///
 /// The service is rather simple on the outside but will one day control
 /// rate limits and the concurrency it uses.
-///
-/// [`SourceConfig`]: ../../types/enum.SourceConfig.html
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DownloadService {
-    worker: RemoteThread,
     config: Arc<Config>,
+    worker: tokio::runtime::Handle,
+    sentry: sentry::SentryDownloader,
+    http: http::HttpDownloader,
+    s3: s3::S3Downloader,
+    gcs: gcs::GcsDownloader,
+    fs: filesystem::FilesystemDownloader,
 }
 
 impl DownloadService {
     /// Creates a new downloader that runs all downloads in the given remote thread.
-    pub fn new(worker: RemoteThread, config: Arc<Config>) -> Self {
-        Self { worker, config }
+    pub fn new(config: Arc<Config>) -> Arc<Self> {
+        let trusted_client = crate::utils::http::create_client(&config, true);
+        let restricted_client = crate::utils::http::create_client(&config, false);
+
+        Arc::new(Self {
+            config,
+            worker: tokio::runtime::Handle::current(),
+            sentry: sentry::SentryDownloader::new(trusted_client),
+            http: http::HttpDownloader::new(restricted_client.clone()),
+            s3: s3::S3Downloader::new(),
+            gcs: gcs::GcsDownloader::new(restricted_client),
+            fs: filesystem::FilesystemDownloader::new(),
+        })
+    }
+
+    /// Dispatches downloading of the given file to the appropriate source.
+    async fn dispatch_download(
+        self: Arc<Self>,
+        source: ObjectFileSource,
+        destination: PathBuf,
+    ) -> Result<DownloadStatus, DownloadError> {
+        match source {
+            ObjectFileSource::Sentry(inner) => {
+                self.sentry.download_source(inner, destination).await
+            }
+            ObjectFileSource::Http(inner) => self.http.download_source(inner, destination).await,
+            ObjectFileSource::S3(inner) => self.s3.download_source(inner, destination).await,
+            ObjectFileSource::Gcs(inner) => self.gcs.download_source(inner, destination).await,
+            ObjectFileSource::Filesystem(inner) => self.fs.download_source(inner, destination),
+        }
     }
 
     /// Download a file from a source and store it on the local filesystem.
     ///
-    /// This does not do any deduplication of requests, every requested file is
-    /// freshly downloaded.
+    /// This does not do any deduplication of requests, every requested file is freshly downloaded.
     ///
-    /// The downloaded file is saved into `destination`.  The file will be created if it
-    /// does not exist and truncated if it does.  In case of any error the file's contents
-    /// is considered garbage.
-    pub fn download(
-        &self,
-        source: SourceFileId,
+    /// The downloaded file is saved into `destination`. The file will be created if it does not
+    /// exist and truncated if it does. In case of any error, the file's contents is considered
+    /// garbage.
+    //
+    // NB: This takes `Arc<Self>` since it needs to spawn into the worker pool internally. Spawning
+    // requires futures to be `'static`, which means there cannot be any references to an externally
+    // owned downloader.
+    pub async fn download(
+        self: Arc<Self>,
+        source: ObjectFileSource,
         destination: PathBuf,
-    ) -> impl Future<Output = Result<DownloadStatus, DownloadError>> {
+    ) -> Result<DownloadStatus, DownloadError> {
         let hub = Hub::current();
+        let slf = self.clone();
 
-        self.worker
-            .spawn("service.download", Duration::from_secs(300), move || {
-                dispatch_download(source, destination).bind_hub(hub)
-            })
-            // Map all SpawnError variants into DownloadError::Canceled.
-            .map(|o| o.unwrap_or_else(|_| Err(DownloadError::Canceled)))
+        // NB: Enter the tokio 1 runtime, which is required to create the timeout.
+        // See: https://docs.rs/tokio/1.0.1/tokio/runtime/struct.Runtime.html#method.enter
+        let _guard = self.worker.enter();
+        let job = slf.dispatch_download(source, destination).bind_hub(hub);
+        let job = tokio::time::timeout(Duration::from_secs(300), job);
+        let job = measure("service.download", m::timed_result, job);
+
+        // Map all SpawnError variants into DownloadError::Canceled.
+        match self.worker.spawn(job).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) | Err(_) => Err(DownloadError::Canceled),
+        }
     }
 
-    pub fn list_files(
-        &self,
+    /// Returns all objects matching the [`ObjectId`] at the source.
+    ///
+    /// Some sources, namely all the symbol servers, simply return the locations at which a
+    /// download attempt should be made without any guarantee the object is actually there.
+    ///
+    /// If the source needs to be contacted to get matching objects this may fail and
+    /// returns a [`DownloadError`].
+    pub async fn list_files(
+        self: Arc<Self>,
         source: SourceConfig,
         filetypes: &'static [FileType],
         object_id: ObjectId,
         hub: Arc<Hub>,
-    ) -> impl Future<Output = Result<Vec<SourceFileId>, DownloadError>> {
-        let worker = self.worker.clone();
-        let config = self.config.clone();
+    ) -> Result<Vec<ObjectFileSource>, DownloadError> {
+        match source {
+            SourceConfig::Sentry(cfg) => {
+                let config = self.config.clone();
+                let slf = self.clone();
 
-        async move {
-            match source {
-                SourceConfig::Sentry(cfg) => {
-                    let job =
-                        move || sentry::list_files(cfg, filetypes, object_id, config).bind_hub(hub);
-
-                    worker
-                        .spawn("service.download.list_files", Duration::from_secs(30), job)
+                // This `async move` ensures that the `list_files` future completes before `slf`
+                // goes out of scope, which ensures 'static lifetime for `spawn` below.
+                let job = async move {
+                    slf.sentry
+                        .list_files(cfg, filetypes, object_id, config)
+                        .bind_hub(hub)
                         .await
-                        // Map all SpawnError variants into DownloadError::Canceled
-                        .unwrap_or_else(|_| Err(DownloadError::Canceled))
-                }
-                SourceConfig::Http(cfg) => Ok(http::list_files(cfg, filetypes, object_id)),
-                SourceConfig::S3(cfg) => Ok(s3::list_files(cfg, filetypes, object_id)),
-                SourceConfig::Gcs(cfg) => Ok(gcs::list_files(cfg, filetypes, object_id)),
-                SourceConfig::Filesystem(cfg) => {
-                    Ok(filesystem::list_files(cfg, filetypes, object_id))
+                };
+
+                // NB: Enter the tokio 1 runtime, which is required to create the timeout.
+                // See: https://docs.rs/tokio/1.0.1/tokio/runtime/struct.Runtime.html#method.enter
+                let _guard = self.worker.enter();
+                let job = tokio::time::timeout(Duration::from_secs(30), job);
+                let job = measure("service.download.list_files", m::timed_result, job);
+
+                // Map all SpawnError variants into DownloadError::Canceled.
+                match self.worker.spawn(job).await {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(_)) | Err(_) => Err(DownloadError::Canceled),
                 }
             }
+            SourceConfig::Http(cfg) => Ok(self.http.list_files(cfg, filetypes, object_id)),
+            SourceConfig::S3(cfg) => Ok(self.s3.list_files(cfg, filetypes, object_id)),
+            SourceConfig::Gcs(cfg) => Ok(self.gcs.list_files(cfg, filetypes, object_id)),
+            SourceConfig::Filesystem(cfg) => Ok(self.fs.list_files(cfg, filetypes, object_id)),
         }
     }
 }
@@ -165,12 +193,12 @@ impl DownloadService {
 ///
 /// This is common functionality used by all many downloaders.
 async fn download_stream(
-    source: SourceFileId,
-    stream: impl Stream<Item = Result<Bytes, DownloadError>>,
+    source: impl Into<ObjectFileSource>,
+    stream: impl Stream<Item = Result<impl AsRef<[u8]>, DownloadError>>,
     destination: PathBuf,
 ) -> Result<DownloadStatus, DownloadError> {
     // All file I/O in this function is blocking!
-    log::trace!("Downloading from {}", source);
+    log::trace!("Downloading from {}", source.into());
     let mut file = File::create(&destination).map_err(DownloadError::BadDestination)?;
     futures::pin_mut!(stream);
 
@@ -182,18 +210,22 @@ async fn download_stream(
     Ok(DownloadStatus::Completed)
 }
 
-/// Iterator to generate a list of filepaths to try downloading from.
-///
-///  - `object_id`: Information about the image we want to download.
-///  - `filetypes`: Limit search to these filetypes.
-///  - `filters`: Filters from a `SourceConfig` to limit the amount of generated paths.
-///  - `layout`: Directory from `SourceConfig` to define what kind of paths we generate.
+/// Iterator to generate a list of [`SourceLocation`]s to attempt downloading.
 #[derive(Debug)]
 struct SourceLocationIter<'a> {
+    /// Limits search to a set of filetypes.
     filetypes: std::slice::Iter<'a, FileType>,
+
+    /// Filters from a `SourceConfig` to limit the amount of generated paths.
     filters: &'a SourceFilters,
+
+    /// Information about the object file to be downloaded.
     object_id: &'a ObjectId,
+
+    /// Directory from `SourceConfig` to define what kind of paths we generate.
     layout: DirectoryLayout,
+
+    /// Remaining locations to iterate.
     next: Vec<String>,
 }
 
@@ -220,54 +252,46 @@ impl Iterator for SourceLocationIter<'_> {
 mod tests {
     // Actual implementation is tested in the sub-modules, this only needs to
     // ensure the service interface works correctly.
+    use super::http::HttpObjectFileSource;
     use super::*;
 
     use crate::sources::SourceConfig;
     use crate::test;
     use crate::types::ObjectType;
 
-    #[test]
-    fn test_download() {
+    #[tokio::test]
+    async fn test_download() {
         test::setup();
-
-        // test::setup() enables logging, but this test spawns a thread where
-        // logging is not captured.  For normal test runs we don't want to
-        // pollute the stdout so silence logs here.  When debugging this test
-        // you may want to temporarily remove this.
-        log::set_max_level(log::LevelFilter::Off);
 
         let tmpfile = tempfile::NamedTempFile::new().unwrap();
         let dest = tmpfile.path().to_owned();
 
         let (_srv, source) = test::symbol_server();
-        let source_id = match source {
+        let file_source = match source {
             SourceConfig::Http(source) => {
-                SourceFileId::Http(source, SourceLocation::new("hello.txt"))
+                HttpObjectFileSource::new(source, SourceLocation::new("hello.txt")).into()
             }
             _ => panic!("unexpected source"),
         };
 
-        let config = Arc::new(Config::default());
+        let config = Arc::new(Config {
+            connect_to_reserved_ips: true,
+            ..Config::default()
+        });
 
-        let service = DownloadService::new(RemoteThread::new_threaded(), config);
+        let service = DownloadService::new(config);
         let dest2 = dest.clone();
 
         // Jump through some hoops here, to prove that we can .await the service.
-        let ret = test::block_fn(move || async move { service.download(source_id, dest2).await });
-        assert_eq!(ret.unwrap(), DownloadStatus::Completed);
+        let download_status = service.download(file_source, dest2).await.unwrap();
+        assert_eq!(download_status, DownloadStatus::Completed);
         let content = std::fs::read_to_string(dest).unwrap();
         assert_eq!(content, "hello world\n")
     }
 
-    #[test]
-    fn test_list_files() {
+    #[tokio::test]
+    async fn test_list_files() {
         test::setup();
-
-        // test::setup() enables logging, but this test spawns a thread where
-        // logging is not captured.  For normal test runs we don't want to
-        // pollute the stdout so silence logs here.  When debugging this test
-        // you may want to temporarily remove this.
-        log::set_max_level(log::LevelFilter::Off);
 
         let source = test::local_source();
         let objid = ObjectId {
@@ -279,18 +303,14 @@ mod tests {
         };
 
         let config = Arc::new(Config::default());
-        let svc = DownloadService::new(RemoteThread::new_threaded(), config);
-        let ret = test::block_fn(|| {
-            svc.list_files(source.clone(), FileType::all(), objid, Hub::current())
-        })
-        .unwrap();
+        let svc = DownloadService::new(config);
+        let file_list = svc
+            .list_files(source.clone(), FileType::all(), objid, Hub::current())
+            .await
+            .unwrap();
 
-        assert!(!ret.is_empty());
-        let item = &ret[0];
-        if let SourceFileId::Filesystem(source_cfg, _loc) = item {
-            assert_eq!(source_cfg.id, source.id());
-        } else {
-            panic!("Not a filesystem item");
-        }
+        assert!(!file_list.is_empty());
+        let item = &file_list[0];
+        assert_eq!(item.source_id(), source.id());
     }
 }

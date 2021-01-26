@@ -1,3 +1,4 @@
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -59,7 +60,10 @@ pub struct Metrics {
 impl Default for Metrics {
     fn default() -> Self {
         Metrics {
-            statsd: None,
+            statsd: match env::var("STATSD_SERVER") {
+                Ok(metrics_statsd) => Some(metrics_statsd),
+                Err(_) => None,
+            },
             prefix: "symbolicator".into(),
         }
     }
@@ -67,7 +71,7 @@ impl Default for Metrics {
 
 /// Fine-tuning downloaded cache expiry.
 ///
-/// These differ from `DerivedCacheConfig` in the `Default::default` implementation.
+/// These differ from [`DerivedCacheConfig`] in the [`Default`] implementation.
 #[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct DownloadedCacheConfig {
@@ -96,7 +100,7 @@ impl Default for DownloadedCacheConfig {
 
 /// Fine-tuning derived cache expiry.
 ///
-/// These differ from `DownloadedCacheConfig` in the `Default::default` implementation.
+/// These differ from [`DownloadedCacheConfig`] in the [`Default`] implementation.
 #[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct DerivedCacheConfig {
@@ -231,7 +235,7 @@ pub struct Config {
     pub symstore_proxy: bool,
 
     /// Default list of sources and the sources used for proxy mode.
-    pub sources: Arc<Vec<SourceConfig>>,
+    pub sources: Arc<[SourceConfig]>,
 
     /// Allow reserved IP addresses for requests to sources.
     pub connect_to_reserved_ips: bool,
@@ -252,7 +256,7 @@ impl Config {
         self.cache_dir.as_ref().map(|base| base.join(dir))
     }
 
-    pub fn default_sources(&self) -> Arc<Vec<SourceConfig>> {
+    pub fn default_sources(&self) -> Arc<[SourceConfig]> {
         self.sources.clone()
     }
 }
@@ -264,7 +268,7 @@ fn is_docker() -> bool {
     }
 
     fs::read_to_string("/proc/self/cgroup")
-        .map(|s| s.find("/docker").is_some())
+        .map(|s| s.contains("/docker"))
         .unwrap_or(false)
 }
 
@@ -298,7 +302,7 @@ impl Default for Config {
             sentry_dsn: None,
             caches: CacheConfigs::default(),
             symstore_proxy: true,
-            sources: Arc::new(vec![]),
+            sources: Arc::from(vec![]),
             connect_to_reserved_ips: false,
             processing_pool_size: num_cpus::get(),
         }

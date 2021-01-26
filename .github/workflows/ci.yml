@@ -28,7 +28,7 @@ jobs:
         run: pip install --upgrade black flake8
 
       - name: Run Black
-        run: black --check tests
+        run: black --check --diff tests
 
       - name: Run Flake8
         run: flake8 tests
@@ -50,11 +50,11 @@ jobs:
           command: fmt
           args: --all -- --check
 
-      - name: Run clipppy
-        uses: actions-rs/clippy-check@v1
+      - name: Run clippy
+        uses: actions-rs/cargo@v1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          args: --all-features --workspace --tests --examples -- -D clippy::all
+          command: clippy
+          args: --all-features --workspace --tests --examples
 
   unit-test:
     name: Unit Tests
@@ -78,6 +78,11 @@ jobs:
         with:
           command: test
           args: --workspace --all-features --locked
+        env:
+          SENTRY_SYMBOLICATOR_GCS_CLIENT_EMAIL: ${{ secrets.SENTRY_SYMBOLICATOR_GCS_CLIENT_EMAIL }}
+          SENTRY_SYMBOLICATOR_GCS_PRIVATE_KEY: ${{ secrets.SENTRY_SYMBOLICATOR_GCS_PRIVATE_KEY }}
+          SENTRY_SYMBOLICATOR_TEST_AWS_ACCESS_KEY_ID: ${{ secrets.SENTRY_SYMBOLICATOR_TEST_AWS_ACCESS_KEY_ID }}
+          SENTRY_SYMBOLICATOR_TEST_AWS_SECRET_ACCESS_KEY: ${{ secrets.SENTRY_SYMBOLICATOR_TEST_AWS_SECRET_ACCESS_KEY }}
 
   integration-test:
     name: Integration Tests
@@ -108,11 +113,6 @@ jobs:
         run: pip install --upgrade pytest pytest-localserver requests pytest-xdist pytest-icdiff boto3
 
       - name: Integration tests
-        env:
-          SENTRY_SYMBOLICATOR_GCS_CLIENT_EMAIL: ${{ secrets.SENTRY_SYMBOLICATOR_GCS_CLIENT_EMAIL }}
-          SENTRY_SYMBOLICATOR_GCS_PRIVATE_KEY: ${{ secrets.SENTRY_SYMBOLICATOR_GCS_PRIVATE_KEY }}
-          SENTRY_SYMBOLICATOR_TEST_AWS_ACCESS_KEY_ID: ${{ secrets.SENTRY_SYMBOLICATOR_TEST_AWS_ACCESS_KEY_ID }}
-          SENTRY_SYMBOLICATOR_TEST_AWS_SECRET_ACCESS_KEY: ${{ secrets.SENTRY_SYMBOLICATOR_TEST_AWS_SECRET_ACCESS_KEY }}
         run: pytest -n12 -vv tests/integration
 
   doc-comments:
@@ -124,10 +124,10 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v2
 
-      - name: Install rust nightly toolchain
+      - name: Install rust stable toolchain
         uses: actions-rs/toolchain@v1
         with:
-          toolchain: nightly
+          toolchain: stable
           profile: minimal
           components: rust-docs
           override: true

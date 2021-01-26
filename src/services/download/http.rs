@@ -1,142 +1,139 @@
 //! Support to download from HTTP sources.
 //!
 //! Specifically this supports the [`HttpSourceConfig`] source.
-//!
-//! [`HttpSourceConfig`]: ../../../sources/struct.HttpSourceConfig.html
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
-use actix_web::http::header;
-use actix_web::{client, HttpMessage};
-use futures::compat::Stream01CompatExt;
+use anyhow::Result;
 use futures::prelude::*;
+use reqwest::{header, Client};
 use url::Url;
 
-use super::{DownloadError, DownloadStatus, USER_AGENT};
-use crate::sources::{FileType, HttpSourceConfig, SourceFileId, SourceLocation};
+use super::{
+    DownloadError, DownloadStatus, ObjectFileSource, ObjectFileSourceURI, SourceLocation,
+    USER_AGENT,
+};
+use crate::sources::{FileType, HttpSourceConfig};
 use crate::types::ObjectId;
 use crate::utils::futures as future_utils;
-use crate::utils::http;
 
-/// The maximum number of redirects permitted by a remote symbol server.
-const MAX_HTTP_REDIRECTS: usize = 10;
-
-/// Joins the relative path to the given URL.
-///
-/// As opposed to `Url::join`, this only supports relative paths. Each segment of the path is
-/// percent-encoded. Empty segments are skipped, for example, `foo//bar` is collapsed to `foo/bar`.
-///
-/// The base URL is treated as directory. If it does not end with a slash, then a slash is
-/// automatically appended.
-///
-/// Returns `Err(())` if the URL is cannot-be-a-base.
-fn join_url_encoded(base: &Url, path: &SourceLocation) -> Result<Url, ()> {
-    let mut joined = base.clone();
-    joined
-        .path_segments_mut()?
-        .pop_if_empty()
-        .extend(path.segments());
-    Ok(joined)
+/// The HTTP-specific [`ObjectFileSource`].
+#[derive(Debug, Clone)]
+pub struct HttpObjectFileSource {
+    pub source: Arc<HttpSourceConfig>,
+    pub location: SourceLocation,
 }
 
-/// Start a request to the web server.
-///
-/// This initiates the request, when the future resolves the headers will have been
-/// retrieved but not the entire payload.
-async fn start_request(
-    source: &HttpSourceConfig,
-    url: Url,
-) -> Result<client::ClientResponse, client::SendRequestError> {
-    http::follow_redirects(url, MAX_HTTP_REDIRECTS, move |url| {
-        let mut builder = client::get(url);
-        for (key, value) in source.headers.iter() {
-            if let Ok(key) = header::HeaderName::from_bytes(key.as_bytes()) {
-                builder.header(key, value.as_str());
-            }
-        }
-        builder.header(header::USER_AGENT, USER_AGENT);
-        // This timeout is for the entire HTTP download *including* the response stream
-        // itself, in contrast to what the Actix-Web docs say. We have tested this
-        // manually.
-        //
-        // The intent is to disable the timeout entirely, but there is no API for that.
-        builder.timeout(Duration::from_secs(9999));
-        builder.finish()
-    })
-    .await
-}
-
-pub async fn download_source(
-    source: Arc<HttpSourceConfig>,
-    download_path: SourceLocation,
-    destination: PathBuf,
-) -> Result<DownloadStatus, DownloadError> {
-    // This can effectively never error since the URL is always validated to be a base URL.
-    // Though unfortunately this happens outside of this service, so ideally we'd fix this.
-    let download_url = match join_url_encoded(&source.url, &download_path) {
-        Ok(x) => x,
-        Err(_) => return Ok(DownloadStatus::NotFound),
-    };
-    log::debug!("Fetching debug file from {}", download_url);
-    let response = future_utils::retry(|| start_request(&source, download_url.clone())).await;
-
-    match response {
-        Ok(response) => {
-            if response.status().is_success() {
-                log::trace!("Success hitting {}", download_url);
-                let stream = response
-                    .payload()
-                    .compat()
-                    .map(|i| i.map_err(DownloadError::stream));
-                super::download_stream(
-                    SourceFileId::Http(source, download_path),
-                    stream,
-                    destination,
-                )
-                .await
-            } else {
-                log::trace!(
-                    "Unexpected status code from {}: {}",
-                    download_url,
-                    response.status()
-                );
-                Ok(DownloadStatus::NotFound)
-            }
-        }
-        Err(e) => {
-            log::trace!("Skipping response from {}: {}", download_url, e);
-            Ok(DownloadStatus::NotFound) // must be wrong type
-        }
+impl From<HttpObjectFileSource> for ObjectFileSource {
+    fn from(source: HttpObjectFileSource) -> Self {
+        Self::Http(source)
     }
 }
 
-pub fn list_files(
-    source: Arc<HttpSourceConfig>,
-    filetypes: &'static [FileType],
-    object_id: ObjectId,
-) -> Vec<SourceFileId> {
-    super::SourceLocationIter {
-        filetypes: filetypes.iter(),
-        filters: &source.files.filters,
-        object_id: &object_id,
-        layout: source.files.layout,
-        next: Vec::new(),
+impl HttpObjectFileSource {
+    pub fn new(source: Arc<HttpSourceConfig>, location: SourceLocation) -> Self {
+        Self { source, location }
     }
-    .map(|loc| SourceFileId::Http(source.clone(), loc))
-    .collect()
+
+    pub fn uri(&self) -> ObjectFileSourceURI {
+        match self.url() {
+            Ok(url) => url.as_ref().into(),
+            Err(_) => "".into(),
+        }
+    }
+
+    /// Returns the URL from which to download this object file.
+    pub fn url(&self) -> Result<Url> {
+        self.location.to_url(&self.source.url)
+    }
+}
+
+/// Downloader implementation that supports the [`HttpSourceConfig`] source.
+#[derive(Debug)]
+pub struct HttpDownloader {
+    client: Client,
+}
+
+impl HttpDownloader {
+    pub fn new(client: Client) -> Self {
+        Self { client }
+    }
+
+    pub async fn download_source(
+        &self,
+        file_source: HttpObjectFileSource,
+        destination: PathBuf,
+    ) -> Result<DownloadStatus, DownloadError> {
+        let download_url = match file_source.url() {
+            Ok(x) => x,
+            Err(_) => return Ok(DownloadStatus::NotFound),
+        };
+
+        log::debug!("Fetching debug file from {}", download_url);
+        let response = future_utils::retry(|| {
+            let mut builder = self.client.get(download_url.clone());
+
+            for (key, value) in file_source.source.headers.iter() {
+                if let Ok(key) = header::HeaderName::from_bytes(key.as_bytes()) {
+                    builder = builder.header(key, value.as_str());
+                }
+            }
+
+            builder.header(header::USER_AGENT, USER_AGENT).send()
+        });
+
+        match response.await {
+            Ok(response) => {
+                if response.status().is_success() {
+                    log::trace!("Success hitting {}", download_url);
+                    let stream = response.bytes_stream().map_err(DownloadError::Reqwest);
+
+                    super::download_stream(file_source, stream, destination).await
+                } else {
+                    log::trace!(
+                        "Unexpected status code from {}: {}",
+                        download_url,
+                        response.status()
+                    );
+                    Ok(DownloadStatus::NotFound)
+                }
+            }
+            Err(e) => {
+                log::trace!("Skipping response from {}: {}", download_url, e);
+                Ok(DownloadStatus::NotFound) // must be wrong type
+            }
+        }
+    }
+
+    pub fn list_files(
+        &self,
+        source: Arc<HttpSourceConfig>,
+        filetypes: &'static [FileType],
+        object_id: ObjectId,
+    ) -> Vec<ObjectFileSource> {
+        super::SourceLocationIter {
+            filetypes: filetypes.iter(),
+            filters: &source.files.filters,
+            object_id: &object_id,
+            layout: source.files.layout,
+            next: Vec::new(),
+        }
+        .map(|loc| HttpObjectFileSource::new(source.clone(), loc).into())
+        .collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::locations::SourceLocation;
     use super::*;
 
     use crate::sources::SourceConfig;
     use crate::test;
 
-    #[test]
-    fn test_download_source() {
+    #[tokio::test]
+    async fn test_download_source() {
         test::setup();
 
         let tmpfile = tempfile::NamedTempFile::new().unwrap();
@@ -148,15 +145,22 @@ mod tests {
             _ => panic!("unexpected source"),
         };
         let loc = SourceLocation::new("hello.txt");
+        let file_source = HttpObjectFileSource::new(http_source, loc);
 
-        let ret = test::block_fn(|| download_source(http_source, loc, dest.clone()));
-        assert_eq!(ret.unwrap(), DownloadStatus::Completed);
+        let downloader = HttpDownloader::new(Client::new());
+        let download_status = downloader
+            .download_source(file_source, dest.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(download_status, DownloadStatus::Completed);
+
         let content = std::fs::read_to_string(dest).unwrap();
         assert_eq!(content, "hello world\n");
     }
 
-    #[test]
-    fn test_download_source_missing() {
+    #[tokio::test]
+    async fn test_download_source_missing() {
         test::setup();
 
         let tmpfile = tempfile::NamedTempFile::new().unwrap();
@@ -168,60 +172,11 @@ mod tests {
             _ => panic!("unexpected source"),
         };
         let loc = SourceLocation::new("i-do-not-exist");
+        let file_source = HttpObjectFileSource::new(http_source, loc);
 
-        let ret = test::block_fn(|| download_source(http_source, loc, dest.clone()));
-        assert_eq!(ret.unwrap(), DownloadStatus::NotFound);
-    }
+        let downloader = HttpDownloader::new(Client::new());
+        let download_status = downloader.download_source(file_source, dest).await.unwrap();
 
-    #[test]
-    fn test_join_empty() {
-        let base = Url::parse("https://example.org/base").unwrap();
-        let joined = join_url_encoded(&base, &SourceLocation::new("")).unwrap();
-        assert_eq!(joined, "https://example.org/base".parse().unwrap());
-    }
-
-    #[test]
-    fn test_join_space() {
-        let base = Url::parse("https://example.org/base").unwrap();
-        let joined = join_url_encoded(&base, &SourceLocation::new("foo bar")).unwrap();
-        assert_eq!(
-            joined,
-            "https://example.org/base/foo%20bar".parse().unwrap()
-        );
-    }
-
-    #[test]
-    fn test_join_multiple() {
-        let base = Url::parse("https://example.org/base").unwrap();
-        let joined = join_url_encoded(&base, &SourceLocation::new("foo/bar")).unwrap();
-        assert_eq!(joined, "https://example.org/base/foo/bar".parse().unwrap());
-    }
-
-    #[test]
-    fn test_join_trailing_slash() {
-        let base = Url::parse("https://example.org/base/").unwrap();
-        let joined = join_url_encoded(&base, &SourceLocation::new("foo")).unwrap();
-        assert_eq!(joined, "https://example.org/base/foo".parse().unwrap());
-    }
-
-    #[test]
-    fn test_join_leading_slash() {
-        let base = Url::parse("https://example.org/base").unwrap();
-        let joined = join_url_encoded(&base, &SourceLocation::new("/foo")).unwrap();
-        assert_eq!(joined, "https://example.org/base/foo".parse().unwrap());
-    }
-
-    #[test]
-    fn test_join_multi_slash() {
-        let base = Url::parse("https://example.org/base").unwrap();
-        let joined = join_url_encoded(&base, &SourceLocation::new("foo//bar")).unwrap();
-        assert_eq!(joined, "https://example.org/base/foo/bar".parse().unwrap());
-    }
-
-    #[test]
-    fn test_join_absolute() {
-        let base = Url::parse("https://example.org/").unwrap();
-        let joined = join_url_encoded(&base, &SourceLocation::new("foo")).unwrap();
-        assert_eq!(joined, "https://example.org/foo".parse().unwrap());
+        assert_eq!(download_status, DownloadStatus::NotFound);
     }
 }

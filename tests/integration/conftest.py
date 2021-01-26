@@ -1,25 +1,19 @@
 import collections
+import copy
 import json
 import os
+import re
 import socket
 import subprocess
 import threading
 import time
 import traceback
-import uuid
 
-import boto3
 import pytest
 import requests
 from pytest_localserver.http import WSGIServer
 
 SYMBOLICATOR_BIN = [os.environ.get("SYMBOLICATOR_BIN") or "target/debug/symbolicator"]
-
-AWS_ACCESS_KEY_ID = os.environ.get("SENTRY_SYMBOLICATOR_TEST_AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = os.environ.get("SENTRY_SYMBOLICATOR_TEST_AWS_SECRET_ACCESS_KEY")
-AWS_REGION_NAME = "us-east-1"
-GCS_PRIVATE_KEY = os.environ.get("SENTRY_SYMBOLICATOR_GCS_PRIVATE_KEY")
-GCS_CLIENT_EMAIL = os.environ.get("SENTRY_SYMBOLICATOR_GCS_CLIENT_EMAIL")
 
 session = requests.session()
 
@@ -201,6 +195,20 @@ class HitCounter:
                 print(f"status code: {r.status_code}")
                 start_response(f"{r.status_code} BOGUS", list(r.headers.items()))
                 return [r.content]
+        elif path.startswith("/symbols/"):
+            print(f"got requested: {path}")
+            path = path[len("/symbols/") :]
+            try:
+                filename = os.path.join(
+                    os.path.dirname(__file__), "..", "fixtures", "symbols", path
+                )
+                with open(filename, "rb") as f:
+                    d = f.read()
+                    start_response("200 OK", [("Content-Length", str(len(d)))])
+                    return [d]
+            except IOError:
+                start_response("404 NOT FOUND", [])
+                return [b""]
         elif path.startswith("/respond_statuscode/"):
             statuscode = int(path.split("/")[2])
             start_response(f"{statuscode} BOGUS", [])
@@ -240,66 +248,31 @@ def hitcounter(request):
         yield app
 
 
-@pytest.fixture
-def s3(pytestconfig):
-    """AWS S3 credentials for testing S3 buckets.
+def assert_symbolication(output, expected):
+    """Compares symbolication results, with redactions.
 
-    This will skip if the secrets are not in the environment, unless we are running on CI in
-    the getsentry team, in which case it will fail.  When running CI not as part of the
-    getsentry team you do not automatically get access to the configured secrets so skipping
-    is allowed.
+    Redactions are necessary to remove random port numbers.
     """
-    if not AWS_ACCESS_KEY_ID or not AWS_SECRET_ACCESS_KEY:
-        msg = "No AWS credentials"
-        if os.getenv("CI") and os.getenv("GITHUB_REPOSITORY").startswith("getsentry/"):
-            pytest.fail(msg)
-        else:
-            pytest.skip(msg)
-    return boto3.resource(
-        "s3",
-        aws_access_key_id=AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-    )
+    __tracebackhide__ = True
+    output = copy.deepcopy(output)
+    expected = copy.deepcopy(expected)
 
+    # dev.getsentry.net gets mapped to 127.0.0.1, that's ugly but simple to use and is what
+    # it actually resolves to.
+    port_re = re.compile(r"^http://(dev.getsentry.net|localhost|127.0.0.1):[0-9]+")
+    s3_bucket_re = re.compile(r"s3://symbolicator-test-[a-f0-9-]+")
 
-@pytest.fixture
-def s3_bucket_config(s3):
-    bucket_name = f"symbolicator-test-{uuid.uuid4()}"
-    s3.create_bucket(Bucket=bucket_name)
+    def redact(d):
+        for module in d.get("modules", []):
+            for candidate in module.get("candidates", []):
+                if "location" in candidate:
+                    candidate["location"] = port_re.sub(
+                        "http://127.0.0.1:<port>", candidate["location"]
+                    )
+                    candidate["location"] = s3_bucket_re.sub(
+                        "s3://symbolicator-tests-<uuid>", candidate["location"]
+                    )
 
-    yield {
-        "type": "s3",
-        "bucket": bucket_name,
-        "access_key": AWS_ACCESS_KEY_ID,
-        "secret_key": AWS_SECRET_ACCESS_KEY,
-        "region": AWS_REGION_NAME,
-    }
-
-    s3.Bucket(bucket_name).objects.all().delete()
-    s3.Bucket(bucket_name).delete()
-
-
-@pytest.fixture
-def ios_bucket_config(pytestconfig):
-    """Google cloud storage bucket for ios symbols.
-
-    This will skip if the secrets are not in the environment, unless we are running on CI in
-    the getsentry team, in which case it will fail.  When running CI not as part of the
-    getsentry team you do not automatically get access to the configured secrets so skipping
-    is allowed.
-    """
-    if not GCS_PRIVATE_KEY or not GCS_CLIENT_EMAIL:
-        msg = "No GCS credentials"
-        if os.getenv("CI") and os.getenv("GITHUB_REPOSITORY").startswith("getsentry/"):
-            pytest.fail(msg)
-        else:
-            pytest.skip(msg)
-    yield {
-        "id": "ios",
-        "type": "gcs",
-        "bucket": "sentryio-system-symbols-0",
-        "private_key": GCS_PRIVATE_KEY,
-        "client_email": GCS_CLIENT_EMAIL,
-        "layout": {"type": "unified"},
-        "prefix": "/ios",
-    }
+    redact(output)
+    redact(expected)
+    assert output == expected

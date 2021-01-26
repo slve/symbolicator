@@ -4,17 +4,19 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use actix::ResponseFuture;
-use futures01::future::{self, Future, Shared};
-use futures01::sync::oneshot;
+use futures::channel::oneshot;
+use futures::future::{self, FutureExt, Shared, TryFutureExt};
 use parking_lot::Mutex;
+use sentry::{Hub, SentryFutureExt};
 use symbolic::common::ByteView;
 use tempfile::NamedTempFile;
 
 use crate::cache::{get_scope_path, Cache, CacheKey, CacheStatus};
 use crate::types::Scope;
-use crate::utils::futures::CallOnDrop;
-use crate::utils::sentry::SentryFutureExt;
+use crate::utils::futures::{spawn_compat, BoxedFuture, CallOnDrop};
+
+/// Result from [`Cacher::compute_memoized`].
+type CacheResultFuture<T, E> = BoxedFuture<Result<Arc<T>, Arc<E>>>;
 
 // Inner result necessary because `futures::Shared` won't give us `Arc`s but its own custom
 // newtype around it.
@@ -29,7 +31,7 @@ type ComputationMap<T, E> = Arc<Mutex<BTreeMap<CacheKey, ComputationChannel<T, E
 /// - Symcaches
 /// - CFI caches
 ///
-/// Transparently performs cache lookups, downloads and cache stores via the `CacheItemRequest`
+/// Transparently performs cache lookups, downloads and cache stores via the [`CacheItemRequest`]
 /// trait and associated types.
 ///
 /// Internally deduplicates concurrent cache lookups (in-memory).
@@ -127,9 +129,12 @@ pub trait CacheItemRequest: 'static + Send {
 
     /// Invoked to compute an instance of this item and put it at the given location in the file
     /// system. This is used to populate the cache for a previously missing element.
-    fn compute(&self, path: &Path) -> Box<dyn Future<Item = CacheStatus, Error = Self::Error>>;
+    fn compute(&self, path: &Path) -> BoxedFuture<Result<CacheStatus, Self::Error>>;
 
     /// Determines whether this item should be loaded.
+    ///
+    /// If this returns `false` the cache will re-computed and be overwritten with the new
+    /// result.
     fn should_load(&self, _data: &[u8]) -> bool {
         true
     }
@@ -146,6 +151,14 @@ pub trait CacheItemRequest: 'static + Send {
 
 impl<T: CacheItemRequest> Cacher<T> {
     /// Look up an item in the file system cache and load it if available.
+    ///
+    /// Returns `Ok(None)` if the cache item needs to be re-computed, otherwise reads the
+    /// cached data from disk and returns the cached item as returned by
+    /// [`CacheItemRequest::load`].
+    ///
+    /// # Errors
+    ///
+    /// If there is an I/O error reading the cache [`CacheItemRequest::Error`] is returned.
     fn lookup_cache(
         &self,
         request: &T,
@@ -188,13 +201,18 @@ impl<T: CacheItemRequest> Cacher<T> {
 
     /// Compute an item.
     ///
-    /// If the item is in the file system cache, it is returned immediately. Otherwise, it is
-    /// computed using `T::compute`, and then persisted to the cache.
-    fn compute(&self, request: T, key: CacheKey) -> ResponseFuture<T::Item, T::Error> {
+    /// If the item is in the file system cache, it is returned immediately. Otherwise, it
+    /// is computed using [`T::compute`](CacheItemRequest::compute), and then persisted to
+    /// the cache.
+    ///
+    /// This method does not take care of ensuring the computation only happens once even
+    /// for concurrent requests, see the public [`Cacher::compute_memoized`] for this.
+    fn compute(&self, request: T, key: CacheKey) -> BoxedFuture<Result<T::Item, T::Error>> {
+        // cache_path is None when caching is disabled.
         let cache_path = get_scope_path(self.config.cache_dir(), &key.scope, &key.cache_key);
         if let Some(ref path) = cache_path {
-            if let Some(item) = tryf!(self.lookup_cache(&request, &key, &path)) {
-                return Box::new(future::ok(item));
+            if let Some(item) = tryf03pin!(self.lookup_cache(&request, &key, &path)) {
+                return Box::pin(future::ok(item));
             }
         }
 
@@ -205,43 +223,46 @@ impl<T: CacheItemRequest> Cacher<T> {
         // just got pruned.
         metric!(counter(&format!("caches.{}.file.miss", name)) += 1);
 
-        let temp_file = tryf!(self.tempfile());
+        let temp_file = tryf03pin!(self.tempfile());
 
-        let future = request.compute(temp_file.path()).and_then(move |status| {
-            if let Some(ref cache_path) = cache_path {
-                sentry::configure_scope(|scope| {
-                    scope.set_extra(
-                        &format!("cache.{}.cache_path", name),
-                        cache_path.to_string_lossy().into(),
+        let future =
+            request
+                .compute(temp_file.path())
+                .and_then(move |status: CacheStatus| async move {
+                    if let Some(ref cache_path) = cache_path {
+                        sentry::configure_scope(|scope| {
+                            scope.set_extra(
+                                &format!("cache.{}.cache_path", name),
+                                cache_path.to_string_lossy().into(),
+                            );
+                        });
+
+                        log::trace!("Creating {} at path {:?}", name, cache_path);
+                    }
+
+                    let byteview = ByteView::open(temp_file.path())?;
+
+                    metric!(
+                        counter(&format!("caches.{}.file.write", name)) += 1,
+                        "status" => status.as_ref(),
                     );
+                    metric!(
+                        time_raw(&format!("caches.{}.file.size", name)) = byteview.len() as u64,
+                        "hit" => "false"
+                    );
+
+                    let path = match cache_path {
+                        Some(ref cache_path) => {
+                            status.persist_item(cache_path, temp_file)?;
+                            CachePath::Cached(cache_path.to_path_buf())
+                        }
+                        None => CachePath::Temp(temp_file.into_temp_path()),
+                    };
+
+                    Ok(request.load(key.scope.clone(), status, byteview, path))
                 });
 
-                log::trace!("Creating {} at path {:?}", name, cache_path);
-            }
-
-            let byteview = ByteView::open(temp_file.path())?;
-
-            metric!(
-                counter(&format!("caches.{}.file.write", name)) += 1,
-                "status" => status.as_ref(),
-            );
-            metric!(
-                time_raw(&format!("caches.{}.file.size", name)) = byteview.len() as u64,
-                "hit" => "false"
-            );
-
-            let path = match cache_path {
-                Some(ref cache_path) => {
-                    status.persist_item(cache_path, temp_file)?;
-                    CachePath::Cached(cache_path.to_path_buf())
-                }
-                None => CachePath::Temp(temp_file.into_temp_path()),
-            };
-
-            Ok(request.load(key.scope.clone(), status, byteview, path))
-        });
-
-        Box::new(future)
+        Box::pin(future)
     }
 
     /// Creates a shareable channel that computes an item.
@@ -255,19 +276,21 @@ impl<T: CacheItemRequest> Cacher<T> {
         }));
 
         // Run the computation and wrap the result in Arcs to make them clonable.
-        let channel = future::lazy(move || slf.compute(request, key))
-            .then(move |result| {
-                // Drop the token first to evict from the map. This ensures that callers either
-                // get a channel that will receive data, or they create a new channel.
-                drop(remove_computation_token);
-                sender.send(result.map(Arc::new).map_err(Arc::new)).ok();
-                Ok(())
-            })
-            .sentry_hub_new_from_current();
+        let channel = async move {
+            let result = match slf.compute(request, key).await {
+                Ok(ok) => Ok(Arc::new(ok)),
+                Err(err) => Err(Arc::new(err)),
+            };
+            // Drop the token first to evict from the map.  This ensures that callers either
+            // get a channel that will receive data, or they create a new channel.
+            drop(remove_computation_token);
+            sender.send(result).ok();
+        }
+        .bind_hub(Hub::new_from_top(Hub::current()));
 
-        // TODO: This spawns into the arbiter of the caller. Consider more explicit resource
-        // allocation here to separate CPU intensive work from I/O work.
-        actix::spawn(channel);
+        // TODO: This spawns into the current_thread runtime of the caller. Consider more explicit
+        // resource allocation here to separate CPU intensive work from I/O work.
+        spawn_compat(channel);
 
         receiver.shared()
     }
@@ -276,7 +299,18 @@ impl<T: CacheItemRequest> Cacher<T> {
     ///
     /// The actual computation is deduplicated between concurrent requests. Finally, the result is
     /// inserted into the cache and all subsequent calls fetch from the cache.
-    pub fn compute_memoized(&self, request: T) -> ResponseFuture<Arc<T::Item>, Arc<T::Error>> {
+    ///
+    /// The computation itself is done by [`T::compute`](CacheItemRequest::compute), but only if it
+    /// was not already in the cache.
+    ///
+    /// # Errors
+    ///
+    /// Cache computation can fail, in which case [`T::compute`](CacheItemRequest::compute)
+    /// will return an error of type [`T::Error`](CacheItemRequest::Error).  When this
+    /// occurs the error result is returned, **however** in this case nothing is written
+    /// into the cache and the next call to the same cache item will attempt to re-compute
+    /// the cache.
+    pub fn compute_memoized(&self, request: T) -> CacheResultFuture<T::Item, T::Error> {
         let key = request.get_cache_key();
         let name = self.config.name();
 
@@ -296,13 +330,13 @@ impl<T: CacheItemRequest> Cacher<T> {
             }
         };
 
-        let future = channel
-            .map_err(move |_cancelled_error| {
-                let message = format!("{} computation channel dropped", name);
-                Arc::new(io::Error::new(io::ErrorKind::Interrupted, message).into())
-            })
-            .and_then(|shared| (*shared).clone());
+        let future = channel.unwrap_or_else(move |_cancelled_error| {
+            let message = format!("{} computation channel dropped", name);
+            Err(Arc::new(
+                io::Error::new(io::ErrorKind::Interrupted, message).into(),
+            ))
+        });
 
-        Box::new(future)
+        Box::pin(future)
     }
 }

@@ -1,10 +1,8 @@
 //! Types for the Symbolicator API.
 //!
-//! This module contains all the types which (de)serialise to/from JSON to make up the
-//! public HTTP API.
-//!
-//! Or at least it strives to.  Currently it also contains some extra common types as well
-//! some types for the public API exist in other places.  Feel free to fix this up.
+//! This module contains some types which (de)serialise to/from JSON to make up the public
+//! HTTP API.  Its messy and things probably need a better place and different way to signal
+//! they are part of the public API.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -20,8 +18,13 @@ use symbolic::debuginfo::Object;
 use symbolic::minidump::processor::FrameTrust;
 use uuid::Uuid;
 
+use crate::utils::addr::AddrMode;
 use crate::utils::hex::HexValue;
 use crate::utils::sentry::WriteSentryScope;
+
+mod objects;
+
+pub use objects::{AllObjectCandidates, ObjectCandidate, ObjectDownloadInfo, ObjectUseInfo};
 
 /// Symbolication task identifier.
 #[derive(Debug, Clone, Copy, Serialize, Ord, PartialOrd, Eq, PartialEq)]
@@ -65,6 +68,15 @@ impl<'de> Deserialize<'de> for Glob {
     {
         let s = Cow::<str>::deserialize(deserializer)?;
         s.parse().map_err(de::Error::custom).map(Glob)
+    }
+}
+
+impl Serialize for Glob {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0.to_string())
     }
 }
 
@@ -113,21 +125,62 @@ impl fmt::Display for Scope {
     }
 }
 
+/// Extra JSON request data for multipart requests.
+///
+/// Multipart requests like `/minidump` and `/applecrashreport` often need some extra
+/// request data together with their main data payload which is included as a JSON-formatted
+/// multi-part.  This can represent this data.
+///
+/// This is meant to be extensible, it is conceivable that the existing `sources` mutli-part
+/// would merge into this one at some point.
+#[derive(Debug, Deserialize)]
+pub struct RequestData {
+    /// Common symbolication per-request options.
+    #[serde(default)]
+    pub options: RequestOptions,
+}
+
+/// Common options for all symbolication API requests.
+///
+/// These options control some features which control the symbolication and general request
+/// handling behaviour.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct RequestOptions {
+    /// Whether to return detailed information on DIF object candidates.
+    ///
+    /// Symbolication requires DIF object files and which ones selected and not selected
+    /// influences the quality of symbolication.  Enabling this will return extra
+    /// information in the modules list section of the response detailing all DIF objects
+    /// considered, any problems with them and what they were used for.  See the
+    /// [`ObjectCandidate`] struct for which extra information is returned for DIF objects.
+    #[serde(default)]
+    pub dif_candidates: bool,
+}
+
 /// A map of register values.
 pub type Registers = BTreeMap<String, HexValue>;
 
-#[allow(clippy::trivially_copy_pass_by_ref)]
-fn is_default_frame_trust(trust: &FrameTrust) -> bool {
-    *trust == FrameTrust::None
+fn is_default_value<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
 }
 
 /// An unsymbolicated frame from a symbolication request.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct RawFrame {
+    /// Controls the addressing mode for [`instruction_addr`](Self::instruction_addr) and
+    /// [`sym_addr`](Self::sym_addr).
+    ///
+    /// If not defined, it defaults to [`AddrMode::Abs`]. The mode can be set to `"rel:INDEX"` to
+    /// make the address relative to the module at the given index ([`AddrMode::Rel`]).
+    #[serde(default, skip_serializing_if = "is_default_value")]
+    pub addr_mode: AddrMode,
+
     /// The absolute instruction address of this frame.
+    ///
+    /// See [`addr_mode`](Self::addr_mode) for the exact behavior of addresses.
     pub instruction_addr: HexValue,
 
-    /// The path to the image this frame is located in.
+    /// The path to the [module](RawObjectInfo) this frame is located in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub package: Option<String>,
 
@@ -139,7 +192,10 @@ pub struct RawFrame {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol: Option<String>,
 
-    /// Start address of the function this frame is located in (lower or equal to instruction_addr).
+    /// Start address of the function this frame is located in (lower or equal to
+    /// [`instruction_addr`](Self::instruction_addr)).
+    ///
+    /// See [`addr_mode`](Self::addr_mode) for the exact behavior of addresses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sym_addr: Option<HexValue>,
 
@@ -151,15 +207,15 @@ pub struct RawFrame {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filename: Option<String>,
 
-    /// Absolute source file path.
+    /// Absolute path to the source file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub abs_path: Option<String>,
 
-    /// The line number within the source file, starting at 1 for the first line.
+    /// The line number within the source file, starting at `1` for the first line.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lineno: Option<u32>,
 
-    /// Source context before the context line
+    /// Source context before the context line.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pre_context: Vec<String>,
 
@@ -172,25 +228,32 @@ pub struct RawFrame {
     pub post_context: Vec<String>,
 
     /// Information about how the raw frame was created.
-    #[serde(default, skip_serializing_if = "is_default_frame_trust")]
+    #[serde(default, skip_serializing_if = "is_default_value")]
     pub trust: FrameTrust,
 }
 
+/// A stack trace containing unsymbolicated stack frames.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct RawStacktrace {
+    /// The OS-dependent identifier of the thread.
     #[serde(default)]
     pub thread_id: Option<u64>,
 
+    /// `true` if this thread triggered the report. Usually indicates that this trace crashed.
     #[serde(default)]
     pub is_requesting: Option<bool>,
 
+    /// Values of CPU registers in the top frame in the trace.
     #[serde(default)]
     pub registers: Registers,
 
+    /// A list of unsymbolicated stack frames.
+    ///
+    /// The first entry in the list is the active frame, with its callers below.
     pub frames: Vec<RawFrame>,
 }
 
-/// Specification of an image loaded into the process.
+/// Specification of a module loaded into the process.
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
 pub struct RawObjectInfo {
     /// Platform image file type (container format).
@@ -214,9 +277,16 @@ pub struct RawObjectInfo {
     pub debug_file: Option<String>,
 
     /// Absolute address at which the image was mounted into virtual memory.
+    ///
+    /// We do allow the `image_addr` to be skipped if it is zero. This is because systems like WASM
+    /// do not require modules to be mounted at a specific absolute address. Per definition, a
+    /// module mounted at `0` does not support absolute addressing.
+    #[serde(default)]
     pub image_addr: HexValue,
 
     /// Size of the image in virtual memory.
+    ///
+    /// The size is infered from the module list if not specified.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_size: Option<u64>,
 }
@@ -228,6 +298,7 @@ pub enum ObjectType {
     Elf,
     Macho,
     Pe,
+    Wasm,
     Unknown,
 }
 
@@ -239,6 +310,7 @@ impl FromStr for ObjectType {
             "elf" => ObjectType::Elf,
             "macho" => ObjectType::Macho,
             "pe" => ObjectType::Pe,
+            "wasm" => ObjectType::Wasm,
             _ => ObjectType::Unknown,
         })
     }
@@ -260,6 +332,7 @@ impl fmt::Display for ObjectType {
             ObjectType::Elf => write!(f, "elf"),
             ObjectType::Macho => write!(f, "macho"),
             ObjectType::Pe => write!(f, "pe"),
+            ObjectType::Wasm => write!(f, "wasm"),
             ObjectType::Unknown => write!(f, "unknown"),
         }
     }
@@ -272,7 +345,7 @@ impl Default for ObjectType {
 }
 
 /// Information on the symbolication status of this frame.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FrameStatus {
     /// The frame was symbolicated successfully.
@@ -294,7 +367,7 @@ impl Default for FrameStatus {
 }
 
 /// A potentially symbolicated frame in the symbolication response.
-#[derive(Debug, Default, Clone, Serialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct SymbolicatedFrame {
     /// Symbolication status of this frame.
     pub status: FrameStatus,
@@ -316,7 +389,7 @@ pub struct SymbolicatedFrame {
 ///
 /// Frames in this request may or may not be symbolicated. The status field contains information on
 /// the individual success for each frame.
-#[derive(Debug, Default, Clone, Serialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct CompleteStacktrace {
     /// ID of thread that had this stacktrace. Returned when a minidump was processed.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -404,16 +477,19 @@ impl ObjectFeatures {
     }
 }
 
-/// Normalized [RawObjectInfo] with status attached.
+/// Normalized [`RawObjectInfo`] with status attached.
 ///
-/// [RawObjectInfo] is what the user sends and [CompleteObjectInfo] is what the user gets.
+/// This describes an object in the modules list of a response to a symbolication request.
+///
+/// [`RawObjectInfo`] is what the user sends and [`CompleteObjectInfo`] is what the user
+/// gets.
 #[derive(Debug, Clone, Serialize, Eq, PartialEq, Deserialize)]
 pub struct CompleteObjectInfo {
     /// Status for fetching the file with debug info.
     pub debug_status: ObjectFileStatus,
 
     /// Status for fetching the file with unwind info (for minidump stackwalking).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub unwind_status: Option<ObjectFileStatus>,
 
     /// Features available during symbolication.
@@ -425,6 +501,50 @@ pub struct CompleteObjectInfo {
     /// More information on the object file.
     #[serde(flatten)]
     pub raw: RawObjectInfo,
+
+    /// More information about the DIF files which were consulted for this object file.
+    ///
+    /// For stackwalking and symbolication we need various Debug Information Files about
+    /// this module.  We look for these DIF files in various locations, this describes all
+    /// the DIF files we looked up and what we know about them, how we used them.  It can be
+    /// helpful to understand what information was available or missing and for which
+    /// reasons.
+    ///
+    /// This list is not serialised if it is empty.
+    #[serde(skip_serializing_if = "AllObjectCandidates::is_empty", default)]
+    pub candidates: AllObjectCandidates,
+}
+
+impl CompleteObjectInfo {
+    /// Given an absolute address converts it into a relative one.
+    ///
+    /// If it does not fit into the object `None` is returned.
+    pub fn abs_to_rel_addr(&self, addr: u64) -> Option<u64> {
+        if self.supports_absolute_addresses() {
+            addr.checked_sub(self.raw.image_addr.0)
+        } else {
+            None
+        }
+    }
+
+    /// Given a relative address returns the absolute address.
+    ///
+    /// Certain environments do not support absolute addresses in which
+    /// case this returns `None`.
+    pub fn rel_to_abs_addr(&self, addr: u64) -> Option<u64> {
+        if self.supports_absolute_addresses() {
+            self.raw.image_addr.0.checked_add(addr)
+        } else {
+            None
+        }
+    }
+
+    /// Checks if this image supports absolute addressing.
+    ///
+    /// Per definition images at 0 do not support absolute addresses.
+    pub fn supports_absolute_addresses(&self) -> bool {
+        self.raw.image_addr.0 != 0
+    }
 }
 
 impl From<RawObjectInfo> for CompleteObjectInfo {
@@ -447,12 +567,13 @@ impl From<RawObjectInfo> for CompleteObjectInfo {
             features: ObjectFeatures::default(),
             arch: Arch::Unknown,
             raw,
+            candidates: AllObjectCandidates::default(),
         }
     }
 }
 
 /// The response of a symbolication request or poll request.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum SymbolicationResponse {
     /// Symbolication is still running.
@@ -478,9 +599,9 @@ pub enum SymbolicationResponse {
 /// This object is the main type containing the symblicated crash as returned by the
 /// `/minidump`, `/symbolicate` and `/applecrashreport` endpoints.  It is publicly
 /// documented at <https://getsentry.github.io/symbolicator/api/response/>.  For the actual
-/// HTTP response this is further wrapped in [SymbolicationResponse] which can also return a
+/// HTTP response this is further wrapped in [`SymbolicationResponse`] which can also return a
 /// pending or failed state etc instead of a result.
-#[derive(Debug, Default, Clone, Serialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct CompletedSymbolicationResponse {
     /// When the crash occurred.
     #[serde(
@@ -525,6 +646,18 @@ pub struct CompletedSymbolicationResponse {
     pub modules: Vec<CompleteObjectInfo>,
 }
 
+impl CompletedSymbolicationResponse {
+    /// Clears out all the information about the DIF object candidates in the modules list.
+    ///
+    /// This will avoid this from being serialised as the DIF object candidates list is not
+    /// serialised when it is empty.
+    pub fn clear_dif_candidates(&mut self) {
+        for module in self.modules.iter_mut() {
+            module.candidates.clear()
+        }
+    }
+}
+
 /// Information about the operating system.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SystemInfo {
@@ -544,9 +677,9 @@ pub struct SystemInfo {
     pub device_model: String,
 }
 
-/// Information to find a Object in external sources and also internal cache.
+/// Information to find an object in external sources and also internal cache.
 ///
-/// See [ObjectId::match_object] for how these can be compared.
+/// See [`ObjectId::match_object`] for how these can be compared.
 #[derive(Debug, Clone, Default)]
 pub struct ObjectId {
     /// Identifier of the code file.

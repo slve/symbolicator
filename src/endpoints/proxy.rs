@@ -1,16 +1,17 @@
 use std::io::Cursor;
 
-use actix::ResponseFuture;
 use actix_web::{http::Method, pred, HttpRequest, HttpResponse, Path, State};
 use bytes::BytesMut;
 use failure::{Error, Fail};
+use futures::future::{FutureExt, TryFutureExt};
 use futures01::{future::Either, Future, IntoFuture, Stream};
 use sentry::Hub;
-use tokio::codec::{BytesCodec, FramedRead};
+use tokio01::codec::{BytesCodec, FramedRead};
 
-use crate::actors::objects::{FindObject, ObjectFileBytes, ObjectPurpose};
+use crate::actors::objects::{FindObject, ObjectPurpose};
 use crate::app::{ServiceApp, ServiceState};
 use crate::types::Scope;
+use crate::utils::futures::ResponseFuture;
 use crate::utils::paths::parse_symstore_path;
 use crate::utils::sentry::{ActixWebHubExt, SentryFutureExt};
 
@@ -45,14 +46,17 @@ fn proxy_symstore_request(
                 scope: Scope::Global,
                 purpose: ObjectPurpose::Debug,
             })
+            .boxed_local()
+            .compat()
             .map_err(|e| e.context("failed to download object").into());
 
         let object_file_opt = object_meta_opt.and_then(move |object_meta_opt| {
-            if let Some(object_meta) = object_meta_opt {
+            if let Some(object_meta) = object_meta_opt.meta {
                 Either::A(
                     state
                         .objects()
                         .fetch(object_meta)
+                        .compat()
                         .map_err(|e| e.context("failed to download object").into())
                         .map(Some),
                 )
@@ -82,7 +86,7 @@ fn proxy_symstore_request(
                     if is_head {
                         Ok(response.finish())
                     } else {
-                        let bytes = Cursor::new(ObjectFileBytes(object_file));
+                        let bytes = Cursor::new(object_file.data());
                         let async_bytes = FramedRead::new(bytes, BytesCodec::new())
                             .map(BytesMut::freeze)
                             .map_err(|e| Error::from(e.context("failed to write object")));

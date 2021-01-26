@@ -1,11 +1,13 @@
-use actix::ResponseFuture;
 use actix_web::{dev::Payload, error, multipart, Error};
 use bytes::{Bytes, BytesMut};
 use futures01::{Future, Stream};
 
 use crate::sources::SourceConfig;
+use crate::types::RequestOptions;
 
-const MAX_SOURCES_SIZE: usize = 1_000_000;
+use super::futures::ResponseFuture;
+
+const MAX_JSON_SIZE: usize = 1_000_000;
 
 pub fn read_multipart_data(
     field: multipart::Field<Payload>,
@@ -42,7 +44,15 @@ pub fn read_multipart_sources(
     field: multipart::Field<Payload>,
 ) -> ResponseFuture<Vec<SourceConfig>, Error> {
     Box::new(
-        read_multipart_data(field, MAX_SOURCES_SIZE)
+        read_multipart_data(field, MAX_JSON_SIZE)
             .and_then(|data| Ok(serde_json::from_slice(&data)?)),
     )
+}
+
+pub fn read_multipart_request_options(
+    field: multipart::Field<Payload>,
+) -> ResponseFuture<RequestOptions, Error> {
+    let fut = read_multipart_data(field, MAX_JSON_SIZE)
+        .and_then(|data| Ok(serde_json::from_slice(&data)?));
+    Box::new(fut)
 }
