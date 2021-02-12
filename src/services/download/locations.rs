@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::sources::SourceId;
-use crate::utils::sentry::WriteSentryScope;
+use crate::utils::sentry::ConfigureScope;
 
 use super::filesystem::FilesystemObjectFileSource;
 use super::gcs::GcsObjectFileSource;
@@ -186,7 +186,7 @@ impl ObjectFileSource {
     /// very abstract.  In general the source should try and producde a URI which can be
     /// used directly into the source-specific tooling.  E.g. for an HTTP source this would
     /// be an `http://` or `https://` URL, for AWS S3 it would be an `s3://` url etc.
-    pub fn uri(&self) -> ObjectFileSourceURI {
+    pub fn uri(&self) -> ObjectFileSourceUri {
         match self {
             ObjectFileSource::Sentry(ref file_source) => file_source.uri(),
             ObjectFileSource::Http(ref file_source) => file_source.uri(),
@@ -197,8 +197,8 @@ impl ObjectFileSource {
     }
 }
 
-impl WriteSentryScope for ObjectFileSource {
-    fn write_sentry_scope(&self, scope: &mut ::sentry::Scope) {
+impl ConfigureScope for ObjectFileSource {
+    fn to_scope(&self, scope: &mut ::sentry::Scope) {
         scope.set_tag("source.id", self.source_id());
         scope.set_tag("source.type", self.source_type_name());
         scope.set_tag("source.is_public", self.is_public());
@@ -214,15 +214,15 @@ impl WriteSentryScope for ObjectFileSource {
 ///
 /// [`ObjectFileSource`]: crate::services::download::ObjectFileSource
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub struct ObjectFileSourceURI(String);
+pub struct ObjectFileSourceUri(String);
 
-impl ObjectFileSourceURI {
+impl ObjectFileSourceUri {
     pub fn new(s: impl Into<String>) -> Self {
         Self(s.into())
     }
 }
 
-impl<T> From<T> for ObjectFileSourceURI
+impl<T> From<T> for ObjectFileSourceUri
 where
     T: Into<String>,
 {
@@ -231,7 +231,7 @@ where
     }
 }
 
-impl fmt::Display for ObjectFileSourceURI {
+impl fmt::Display for ObjectFileSourceUri {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", self.0)
     }

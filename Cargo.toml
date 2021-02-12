@@ -1,6 +1,6 @@
 [package]
 name = "symbolicator"
-version = "0.3.2"
+version = "0.3.3"
 authors = ["Sentry <hello@getsentry.com>"]
 edition = "2018"
 license = "MIT"
@@ -13,11 +13,10 @@ anyhow = "1.0.38"
 apple-crash-report-parser = "0.4.2"
 backtrace = "0.3.55"
 base64 = "0.13.0"
-bytes = { version = "0.4.12", features = ["serde"] }
+bytes = { version = "1.0.1", features = ["serde"] }
 cadence = "0.18.0"
 chrono = { version = "0.4.19", features = ["serde"] }
 console = "0.14.0"
-crc32fast = "1.2.1"
 env_logger = "0.7.1"
 failure = "0.1.8"
 flate2 = "1.0.19"
@@ -27,8 +26,7 @@ futures01 = { version = "0.1.29", package = "futures" }
 glob = "0.3.0"
 humantime-serde = "1.0.1"
 ipnetwork = "0.17.0"
-# needed for gcs, see https://github.com/Keats/jsonwebtoken/pull/89
-jsonwebtoken = { git = "https://github.com/Keats/jsonwebtoken", rev = "b8627260b2902a1ab4fdda83083be3e0b0fb9b7f" }
+jsonwebtoken = "7.2.0"
 lazy_static = "1.4.0"
 log = { version = "0.4.13", features = ["serde"] }
 lru = "0.6.3"
@@ -49,7 +47,7 @@ structopt = "0.3.21"
 symbolic = { git = "https://github.com/getsentry/symbolic", branch = "fix/demangle-fixes", features = ["common-serde", "demangle", "minidump-serde", "symcache"] }
 tempfile = "3.2.0"
 thiserror = "1.0.23"
-tokio = { version = "1.0.2", features = ["rt", "macros"] }
+tokio = { version = "1.0.2", features = ["rt", "macros", "fs"] }
 tokio01 = { version = "0.1.22", package = "tokio" }
 url = { version = "2.2.0", features = ["serde"] }
 uuid = { version = "0.8.2", features = ["v4", "serde"] }

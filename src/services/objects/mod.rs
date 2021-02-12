@@ -10,15 +10,14 @@ use futures::future::{self, Future, TryFutureExt};
 use sentry::SentryFutureExt;
 use symbolic::debuginfo;
 
-use crate::actors::common::cache::Cacher;
 use crate::cache::{Cache, CacheStatus};
 use crate::logging::LogError;
+use crate::services::cacher::Cacher;
 use crate::services::download::{
-    DownloadError, DownloadService, ObjectFileSource, ObjectFileSourceURI,
+    DownloadError, DownloadService, ObjectFileSource, ObjectFileSourceUri,
 };
 use crate::sources::{FileType, SourceConfig, SourceId};
 use crate::types::{AllObjectCandidates, ObjectCandidate, ObjectDownloadInfo, ObjectId, Scope};
-use crate::utils::futures::ThreadPool;
 
 use data_cache::FetchFileDataRequest;
 use meta_cache::FetchFileMetaRequest;
@@ -125,7 +124,7 @@ impl From<debuginfo::ObjectError> for ObjectError {
 /// itself contain the [`SourceId`] and [`SourceLocation`].  However we need to carry this
 /// along some errors, so we use this wrapper.
 ///
-/// [`CacheItemRequest`]: crate::actors::common::cache::CacheItemRequest
+/// [`CacheItemRequest`]: crate::services::cacher::CacheItemRequest
 /// [`SourceId`]: crate::sources::SourceId
 /// [`SourceLocation`]: crate::services::download::SourceLocation
 #[derive(Debug)]
@@ -140,21 +139,14 @@ struct CacheLookupError {
 pub struct ObjectsActor {
     meta_cache: Arc<Cacher<FetchFileMetaRequest>>,
     data_cache: Arc<Cacher<FetchFileDataRequest>>,
-    threadpool: ThreadPool,
     download_svc: Arc<DownloadService>,
 }
 
 impl ObjectsActor {
-    pub fn new(
-        meta_cache: Cache,
-        data_cache: Cache,
-        threadpool: ThreadPool,
-        download_svc: Arc<DownloadService>,
-    ) -> Self {
+    pub fn new(meta_cache: Cache, data_cache: Cache, download_svc: Arc<DownloadService>) -> Self {
         ObjectsActor {
             meta_cache: Arc::new(Cacher::new(meta_cache)),
             data_cache: Arc::new(Cacher::new(data_cache)),
-            threadpool,
             download_svc,
         }
     }
@@ -302,7 +294,6 @@ impl ObjectsActor {
         for file_source in file_sources {
             let object_id = identifier.clone();
             let scope = scope.clone();
-            let threadpool = self.threadpool.clone();
             let data_cache = self.data_cache.clone();
             let download_svc = self.download_svc.clone();
             let meta_cache = self.meta_cache.clone();
@@ -317,7 +308,6 @@ impl ObjectsActor {
                     scope,
                     file_source: file_source.clone(),
                     object_id,
-                    threadpool,
                     data_cache,
                     download_svc,
                 };
@@ -434,7 +424,7 @@ fn create_candidates(
     for source_id in source_ids {
         let info = ObjectCandidate {
             source: source_id,
-            location: ObjectFileSourceURI::new("No object files listed on this source"),
+            location: ObjectFileSourceUri::new("No object files listed on this source"),
             download: ObjectDownloadInfo::NotFound,
             unwind: Default::default(),
             debug: Default::default(),

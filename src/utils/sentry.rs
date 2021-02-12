@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
 use actix_web::middleware::{Finished, Middleware, Response, Started};
-use actix_web::{Error, HttpRequest, HttpResponse};
+use actix_web::{Error, FromRequest, HttpRequest, HttpResponse};
 use failure::Fail;
 use futures01::future::Future;
 use futures01::Poll;
@@ -71,10 +71,14 @@ pub trait SentryFutureExt: Sized {
 impl<F> SentryFutureExt for F where F: futures01::future::Future {}
 
 /// Write own data to [`sentry::Scope`], only the subset that is considered useful for debugging.
-// Right now, this could have been a simple method, but the idea is that one day we want a custom
-// derive for this.
-pub trait WriteSentryScope {
-    fn write_sentry_scope(&self, scope: &mut Scope);
+pub trait ConfigureScope {
+    /// Writes information to the given scope.
+    fn to_scope(&self, scope: &mut Scope);
+
+    /// Configures the current scope.
+    fn configure_scope(&self) {
+        sentry::configure_scope(|scope| self.to_scope(scope));
+    }
 }
 
 /// Reports certain failures to sentry.
@@ -296,5 +300,23 @@ fn exception_from_single_fail<F: Fail + ?Sized>(
             .map(|bt| format!("{:#?}", bt))
             .and_then(|x| parse_stacktrace(&x)),
         ..Default::default()
+    }
+}
+
+#[derive(Debug)]
+pub struct ActixHub(Arc<Hub>);
+
+impl<S> FromRequest<S> for ActixHub {
+    type Config = ();
+    type Result = Self;
+
+    fn from_request(req: &HttpRequest<S>, _: &Self::Config) -> Self::Result {
+        Self(Hub::from_request(req))
+    }
+}
+
+impl From<ActixHub> for Arc<Hub> {
+    fn from(ah: ActixHub) -> Self {
+        ah.0
     }
 }

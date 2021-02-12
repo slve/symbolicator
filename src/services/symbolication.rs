@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::TryInto;
 use std::future::Future;
-use std::io::Write;
+use std::io::{Cursor, Write};
 use std::iter::FromIterator;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use apple_crash_report_parser::AppleCrashReport;
-use bytes::{Bytes, IntoBuf};
+use bytes::Bytes;
 use chrono::{DateTime, TimeZone, Utc};
 use futures::{channel::oneshot, future, FutureExt as _};
 use parking_lot::Mutex;
@@ -29,11 +29,11 @@ use symbolic::minidump::processor::{
 };
 use thiserror::Error;
 
-use crate::actors::cficaches::{CfiCacheActor, CfiCacheError, CfiCacheFile, FetchCfiCache};
-use crate::actors::objects::{FindObject, ObjectError, ObjectPurpose, ObjectsActor};
-use crate::actors::symcaches::{FetchSymCache, SymCacheActor, SymCacheError, SymCacheFile};
 use crate::cache::CacheStatus;
 use crate::logging::LogError;
+use crate::services::cficaches::{CfiCacheActor, CfiCacheError, CfiCacheFile, FetchCfiCache};
+use crate::services::objects::{FindObject, ObjectError, ObjectPurpose, ObjectsActor};
+use crate::services::symcaches::{FetchSymCache, SymCacheActor, SymCacheError, SymCacheFile};
 use crate::sources::{FileType, SourceConfig};
 use crate::types::{
     CompleteObjectInfo, CompleteStacktrace, CompletedSymbolicationResponse, FrameStatus,
@@ -1276,7 +1276,7 @@ impl SymbolicationActor {
                 spawn_result,
                 Duration::from_secs(20),
                 "minidump.modules.spawn.error",
-                minidump,
+                &minidump,
                 diagnostics_cache,
             )
         };
@@ -1296,7 +1296,7 @@ impl SymbolicationActor {
         handle: procspawn::JoinHandle<Result<procspawn::serde::Json<T>, E>>,
         timeout: Duration,
         metric: &str,
-        minidump: Bytes,
+        minidump: &[u8],
         minidump_cache: crate::cache::Cache,
     ) -> Result<T, anyhow::Error>
     where
@@ -1343,7 +1343,7 @@ impl SymbolicationActor {
 
     /// Save a minidump to temporary location.
     fn save_minidump(
-        minidump: Bytes,
+        minidump: &[u8],
         failed_cache: crate::cache::Cache,
     ) -> anyhow::Result<Option<PathBuf>> {
         if let Some(dir) = failed_cache.cache_dir() {
@@ -1654,7 +1654,7 @@ impl SymbolicationActor {
                 spawn_result,
                 Duration::from_secs(60),
                 "minidump.stackwalk.spawn.error",
-                minidump,
+                &minidump,
                 diagnostics_cache,
             )?;
 
@@ -1685,12 +1685,12 @@ impl SymbolicationActor {
     async fn do_stackwalk_minidump(
         self,
         scope: Scope,
-        minidump: Bytes,
-        sources: Vec<SourceConfig>,
+        minidump: Vec<u8>,
+        sources: Arc<[SourceConfig]>,
         options: RequestOptions,
     ) -> Result<(SymbolicateStacktraces, MinidumpState), SymbolicationError> {
         let future = async move {
-            let sources: Arc<[SourceConfig]> = Arc::from(sources);
+            let minidump = Bytes::from(minidump);
 
             let referenced_modules = self
                 .get_referenced_modules_from_minidump(minidump.clone())
@@ -1715,8 +1715,8 @@ impl SymbolicationActor {
     async fn do_process_minidump(
         self,
         scope: Scope,
-        minidump: Bytes,
-        sources: Vec<SourceConfig>,
+        minidump: Vec<u8>,
+        sources: Arc<[SourceConfig]>,
         options: RequestOptions,
     ) -> Result<CompletedSymbolicationResponse, SymbolicationError> {
         let (request, state) = self
@@ -1733,8 +1733,8 @@ impl SymbolicationActor {
     pub fn process_minidump(
         &self,
         scope: Scope,
-        minidump: Bytes,
-        sources: Vec<SourceConfig>,
+        minidump: Vec<u8>,
+        sources: Arc<[SourceConfig]>,
         options: RequestOptions,
     ) -> RequestId {
         self.create_symbolication_request(
@@ -1795,12 +1795,12 @@ impl SymbolicationActor {
     async fn parse_apple_crash_report(
         &self,
         scope: Scope,
-        minidump: Bytes,
-        sources: Vec<SourceConfig>,
+        minidump: Vec<u8>,
+        sources: Arc<[SourceConfig]>,
         options: RequestOptions,
     ) -> Result<(SymbolicateStacktraces, AppleCrashReportState), SymbolicationError> {
         let parse_future = async {
-            let report = AppleCrashReport::from_reader(minidump.into_buf())?;
+            let report = AppleCrashReport::from_reader(Cursor::new(minidump))?;
             let mut metadata = report.metadata;
 
             let arch = report
@@ -1847,7 +1847,7 @@ impl SymbolicationActor {
             let request = SymbolicateStacktraces {
                 modules,
                 scope,
-                sources: Arc::from(sources),
+                sources,
                 signal: None,
                 stacktraces,
                 options,
@@ -1908,8 +1908,8 @@ impl SymbolicationActor {
     async fn do_process_apple_crash_report(
         self,
         scope: Scope,
-        report: Bytes,
-        sources: Vec<SourceConfig>,
+        report: Vec<u8>,
+        sources: Arc<[SourceConfig]>,
         options: RequestOptions,
     ) -> Result<CompletedSymbolicationResponse, SymbolicationError> {
         let (request, state) = self
@@ -1924,8 +1924,8 @@ impl SymbolicationActor {
     pub fn process_apple_crash_report(
         &self,
         scope: Scope,
-        apple_crash_report: Bytes,
-        sources: Vec<SourceConfig>,
+        apple_crash_report: Vec<u8>,
+        sources: Arc<[SourceConfig]>,
         options: RequestOptions,
     ) -> RequestId {
         self.create_symbolication_request(self.clone().do_process_apple_crash_report(
@@ -1999,8 +1999,8 @@ mod tests {
 
     use std::fs;
 
-    use crate::app::ServiceState;
     use crate::config::Config;
+    use crate::services::Service;
     use crate::test;
 
     /// Setup tests and create a test service.
@@ -2011,7 +2011,7 @@ mod tests {
     ///
     /// The service is configured with `connect_to_reserved_ips = True`. This allows to use a local
     /// symbol server to test object file downloads.
-    fn setup_service() -> (ServiceState, test::TempDir) {
+    fn setup_service() -> (Service, test::TempDir) {
         test::setup();
 
         let cache_dir = test::tempdir();
@@ -2021,7 +2021,7 @@ mod tests {
             connect_to_reserved_ips: true,
             ..Default::default()
         };
-        let service = ServiceState::create(config).unwrap();
+        let service = Service::create(config).unwrap();
 
         (service, cache_dir)
     }
@@ -2070,7 +2070,7 @@ mod tests {
         ($e:expr) => {
             ::insta::assert_yaml_snapshot!($e, {
                 ".**.location" => ::insta::dynamic_redaction(
-                    $crate::actors::symbolication::tests::redact_localhost_port
+                    $crate::services::symbolication::tests::redact_localhost_port
                 )
             });
         }
@@ -2186,13 +2186,13 @@ mod tests {
         let (service, _cache_dir) = setup_service();
         let (_symsrv, source) = test::symbol_server();
 
-        let minidump = Bytes::from(fs::read(path)?);
+        let minidump = fs::read(path)?;
         let symbolication = service.symbolication();
         let response = test::spawn_compat(move || async move {
             let request_id = symbolication.process_minidump(
                 Scope::Global,
                 minidump,
-                vec![source],
+                Arc::new([source]),
                 RequestOptions {
                     dif_candidates: true,
                 },
@@ -2233,12 +2233,12 @@ mod tests {
         let (service, _cache_dir) = setup_service();
         let (_symsrv, source) = test::symbol_server();
 
-        let report_file = Bytes::from(fs::read("./tests/fixtures/apple_crash_report.txt")?);
+        let report_file = fs::read("./tests/fixtures/apple_crash_report.txt")?;
         let response = test::spawn_compat(move || async move {
             let request_id = service.symbolication().process_apple_crash_report(
                 Scope::Global,
                 report_file,
-                vec![source],
+                Arc::new([source]),
                 RequestOptions {
                     dif_candidates: true,
                 },

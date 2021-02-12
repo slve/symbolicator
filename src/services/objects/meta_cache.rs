@@ -14,12 +14,12 @@ use std::sync::Arc;
 use symbolic::common::ByteView;
 use symbolic::debuginfo::Object;
 
-use crate::actors::common::cache::{CacheItemRequest, CachePath, Cacher};
 use crate::cache::{CacheKey, CacheStatus};
-use crate::services::download::{ObjectFileSource, ObjectFileSourceURI};
+use crate::services::cacher::{CacheItemRequest, CachePath, Cacher};
+use crate::services::download::{ObjectFileSource, ObjectFileSourceUri};
 use crate::sources::SourceId;
 use crate::types::{ObjectFeatures, ObjectId, Scope};
-use crate::utils::futures::{BoxedFuture, ThreadPool};
+use crate::utils::futures::BoxedFuture;
 
 use super::{FetchFileDataRequest, ObjectError, ObjectHandle};
 
@@ -35,7 +35,6 @@ pub(super) struct FetchFileMetaRequest {
     // XXX: This kind of state is not request data. We should find a different way to get this into
     // `<FetchFileMetaRequest as CacheItemRequest>::compute`, e.g. make the Cacher hold arbitrary
     // state for computing.
-    pub(super) threadpool: ThreadPool,
     pub(super) data_cache: Arc<Cacher<FetchFileDataRequest>>,
     pub(super) download_svc: Arc<crate::services::download::DownloadService>,
 }
@@ -64,7 +63,7 @@ impl ObjectMetaHandle {
         self.request.file_source.source_id()
     }
 
-    pub fn uri(&self) -> ObjectFileSourceURI {
+    pub fn uri(&self) -> ObjectFileSourceUri {
         self.request.file_source.uri()
     }
 

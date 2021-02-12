@@ -1,14 +1,14 @@
-use actix_web::{http::Method, HttpRequest};
+use actix_web::{App, HttpRequest};
 
-use crate::app::{ServiceApp, ServiceState};
+use crate::services::Service;
 
-fn healthcheck(_req: HttpRequest<ServiceState>) -> &'static str {
+fn healthcheck(_req: HttpRequest<Service>) -> &'static str {
     metric!(counter("healthcheck") += 1);
     "ok"
 }
 
-pub fn configure(app: ServiceApp) -> ServiceApp {
+pub fn configure(app: App<Service>) -> App<Service> {
     app.resource("/healthcheck", |r| {
-        r.method(Method::GET).with(healthcheck);
+        r.get().with(healthcheck);
     })
 }
