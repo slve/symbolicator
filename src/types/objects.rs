@@ -229,11 +229,6 @@ impl AllObjectCandidates {
         self.0.is_empty()
     }
 
-    /// Removes all DIF object from this candidates collection.
-    pub fn clear(&mut self) {
-        self.0.clear()
-    }
-
     /// Merge in the other collection of candidates.
     ///
     /// If a candidate already existed in the collection all data which is present in both
