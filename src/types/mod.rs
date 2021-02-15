@@ -641,9 +641,6 @@ pub struct CompletedSymbolicationResponse {
 
     /// The threads containing symbolicated stack frames.
     pub stacktraces: Vec<CompleteStacktrace>,
-
-    /// A list of images, extended with status information.
-    pub modules: Vec<CompleteObjectInfo>,
 }
 
 impl CompletedSymbolicationResponse {
@@ -651,11 +648,7 @@ impl CompletedSymbolicationResponse {
     ///
     /// This will avoid this from being serialised as the DIF object candidates list is not
     /// serialised when it is empty.
-    pub fn clear_dif_candidates(&mut self) {
-        for module in self.modules.iter_mut() {
-            module.candidates.clear()
-        }
-    }
+    pub fn clear_dif_candidates(&mut self) {}
 }
 
 /// Information about the operating system.

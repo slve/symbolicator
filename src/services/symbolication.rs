@@ -1067,7 +1067,6 @@ impl SymbolicationActor {
 
             CompletedSymbolicationResponse {
                 signal,
-                modules,
                 stacktraces,
                 ..Default::default()
             }
@@ -1202,15 +1201,6 @@ impl MinidumpState {
     ///
     /// This updates the `response` with the meta-data contained.
     fn merge_into(mut self, response: &mut CompletedSymbolicationResponse) {
-        if self.system_info.cpu_arch == Arch::Unknown {
-            self.system_info.cpu_arch = response
-                .modules
-                .iter()
-                .map(|object| object.arch)
-                .find(|arch| *arch != Arch::Unknown)
-                .unwrap_or_default();
-        }
-
         response.timestamp = Some(self.timestamp);
         response.system_info = Some(self.system_info);
         response.crashed = Some(self.crashed);
@@ -1754,15 +1744,6 @@ struct AppleCrashReportState {
 
 impl AppleCrashReportState {
     fn merge_into(mut self, response: &mut CompletedSymbolicationResponse) {
-        if self.system_info.cpu_arch == Arch::Unknown {
-            self.system_info.cpu_arch = response
-                .modules
-                .iter()
-                .map(|object| object.arch)
-                .find(|arch| *arch != Arch::Unknown)
-                .unwrap_or_default();
-        }
-
         response.timestamp = self.timestamp;
         response.system_info = Some(self.system_info);
         response.crash_reason = self.crash_reason;
