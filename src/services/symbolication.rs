@@ -1198,7 +1198,7 @@ impl MinidumpState {
     /// Merges this meta-data into a symbolication result.
     ///
     /// This updates the `response` with the meta-data contained.
-    fn merge_into(mut self, response: &mut CompletedSymbolicationResponse) {
+    fn merge_into(self, response: &mut CompletedSymbolicationResponse) {
         response.timestamp = Some(self.timestamp);
         response.system_info = Some(self.system_info);
         response.crashed = Some(self.crashed);
@@ -1741,7 +1741,7 @@ struct AppleCrashReportState {
 }
 
 impl AppleCrashReportState {
-    fn merge_into(mut self, response: &mut CompletedSymbolicationResponse) {
+    fn merge_into(self, response: &mut CompletedSymbolicationResponse) {
         response.timestamp = self.timestamp;
         response.system_info = Some(self.system_info);
         response.crash_reason = self.crash_reason;
