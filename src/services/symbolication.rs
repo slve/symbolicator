@@ -18,9 +18,7 @@ use sentry::protocol::SessionStatus;
 use sentry::{Hub, SentryFutureExt};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use symbolic::common::{
-    Arch, ByteView, CodeId, DebugId, InstructionInfo, Language, Name, SelfCell,
-};
+use symbolic::common::{ByteView, CodeId, DebugId, InstructionInfo, Language, Name, SelfCell};
 use symbolic::debuginfo::{Object, ObjectDebugSession};
 use symbolic::demangle::{Demangle, DemangleOptions};
 use symbolic::minidump::cfi::CfiCache;
